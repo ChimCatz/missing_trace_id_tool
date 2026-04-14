@@ -3,19 +3,18 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 import pandas as pd
-import re
 
 from trace_logic import extract_numbers, find_missing
 
@@ -24,306 +23,215 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Missing Trace ID Finder")
-        self.resize(860, 560)
-        self.setMinimumSize(760, 500)
+        self.setWindowTitle("Missing Trace ID Tool v2")
+        self.resize(760, 500)
+        self.setMinimumSize(700, 460)
 
         self.df = None
         self.missing = []
-        self.loaded_file = ""
 
         self._build_ui()
         self._apply_styles()
         self._refresh_actions()
 
     def _build_ui(self):
-        root = QWidget()
-        outer_layout = QVBoxLayout(root)
-        outer_layout.setContentsMargins(28, 28, 28, 28)
-        outer_layout.setSpacing(18)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        hero_card = QFrame()
-        hero_card.setObjectName("heroCard")
-        hero_layout = QVBoxLayout(hero_card)
-        hero_layout.setContentsMargins(26, 24, 26, 24)
-        hero_layout.setSpacing(8)
-
-        eyebrow = QLabel("TRACE COVERAGE CHECK")
-        eyebrow.setObjectName("eyebrow")
-        hero_layout.addWidget(eyebrow)
+        container = QWidget()
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(20, 18, 20, 18)
+        main_layout.setSpacing(10)
 
         title = QLabel("Missing Trace ID Finder")
         title.setObjectName("titleLabel")
-        hero_layout.addWidget(title)
+        main_layout.addWidget(title)
 
         subtitle = QLabel(
-            "Load a CSV, detect the Trace ID column, and export any missing IDs in one pass."
+            "Import a CSV file, select the Trace ID column, and export missing IDs."
         )
         subtitle.setObjectName("subtitleLabel")
         subtitle.setWordWrap(True)
-        hero_layout.addWidget(subtitle)
+        main_layout.addWidget(subtitle)
 
-        self.status = QLabel("Import a CSV file to begin.")
-        self.status.setObjectName("statusBanner")
+        self.status = QLabel("Import CSV to begin.")
+        self.status.setObjectName("statusLabel")
         self.status.setWordWrap(True)
-        hero_layout.addWidget(self.status)
+        main_layout.addWidget(self.status)
 
-        outer_layout.addWidget(hero_card)
+        file_panel = QFrame()
+        file_panel.setObjectName("panel")
+        file_layout = QVBoxLayout(file_panel)
+        file_layout.setContentsMargins(14, 14, 14, 14)
+        file_layout.setSpacing(8)
 
-        controls_card = QFrame()
-        controls_card.setObjectName("panelCard")
-        controls_layout = QVBoxLayout(controls_card)
-        controls_layout.setContentsMargins(24, 22, 24, 22)
-        controls_layout.setSpacing(16)
-
-        controls_header = QLabel("Data Source")
-        controls_header.setObjectName("sectionTitle")
-        controls_layout.addWidget(controls_header)
-
-        file_row = QHBoxLayout()
-        file_row.setSpacing(12)
+        import_row = QHBoxLayout()
+        import_row.setSpacing(10)
 
         self.import_btn = QPushButton("Import CSV")
-        self.import_btn.setObjectName("primaryButton")
+        self.import_btn.setObjectName("importButton")
         self.import_btn.clicked.connect(self.import_csv)
-        file_row.addWidget(self.import_btn, 0)
+        import_row.addWidget(self.import_btn, 0)
 
         self.file_label = QLabel("No file selected")
-        self.file_label.setObjectName("mutedLabel")
+        self.file_label.setObjectName("fileLabel")
         self.file_label.setWordWrap(True)
-        file_row.addWidget(self.file_label, 1)
+        import_row.addWidget(self.file_label, 1)
 
-        controls_layout.addLayout(file_row)
-
-        selection_row = QHBoxLayout()
-        selection_row.setSpacing(12)
+        file_layout.addLayout(import_row)
 
         self.column_box = QComboBox()
         self.column_box.setEditable(True)
-        self.column_box.lineEdit().setAlignment(Qt.AlignCenter)
-        self.column_box.lineEdit().setPlaceholderText("Trace ID column")
+        self.column_box.lineEdit().setAlignment(Qt.AlignLeft)
+        self.column_box.lineEdit().setPlaceholderText("Select or type the Trace ID column")
         self.column_box.currentTextChanged.connect(self.column_changed)
-        selection_row.addWidget(self.column_box, 3)
+        file_layout.addWidget(self.column_box)
 
         self.expected_input = QLineEdit()
         self.expected_input.setPlaceholderText(
-            "Expected total records (optional)"
+            "Expected total record count (optional)"
         )
         self.expected_input.textChanged.connect(self.expected_changed)
-        selection_row.addWidget(self.expected_input, 2)
+        file_layout.addWidget(self.expected_input)
 
-        controls_layout.addLayout(selection_row)
-
-        self.helper_label = QLabel(
-            "Tip: enter the expected total only when you know the full record count."
+        helper = QLabel(
+            "Only enter the expected total if you know the exact number of records."
         )
-        self.helper_label.setObjectName("helperLabel")
-        self.helper_label.setWordWrap(True)
-        controls_layout.addWidget(self.helper_label)
+        helper.setObjectName("helperLabel")
+        helper.setWordWrap(True)
+        file_layout.addWidget(helper)
 
-        outer_layout.addWidget(controls_card)
+        main_layout.addWidget(file_panel)
 
-        stats_card = QFrame()
-        stats_card.setObjectName("panelCard")
-        stats_layout = QVBoxLayout(stats_card)
-        stats_layout.setContentsMargins(24, 22, 24, 22)
-        stats_layout.setSpacing(16)
+        stats_panel = QFrame()
+        stats_panel.setObjectName("panel")
+        stats_layout = QVBoxLayout(stats_panel)
+        stats_layout.setContentsMargins(14, 14, 14, 14)
+        stats_layout.setSpacing(6)
 
-        stats_header = QLabel("Scan Summary")
-        stats_header.setObjectName("sectionTitle")
-        stats_layout.addWidget(stats_header)
+        self.records_label = QLabel("Records scanned: -")
+        self.last_label = QLabel("Last Trace ID: -")
+        self.missing_label = QLabel("Missing IDs: -")
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(14)
+        for label in (self.records_label, self.last_label, self.missing_label):
+            label.setObjectName("statsLabel")
+            label.setWordWrap(True)
+            stats_layout.addWidget(label)
 
-        self.records_label = self._create_metric_card(
-            "Rows Loaded", "Import a CSV to see the count."
-        )
-        self.last_label = self._create_metric_card(
-            "Last Trace ID", "The highest detected ID will appear here."
-        )
-        self.missing_label = self._create_metric_card(
-            "Missing IDs", "Missing Trace IDs will be counted here."
-        )
-
-        grid.addWidget(self.records_label.parentWidget(), 0, 0)
-        grid.addWidget(self.last_label.parentWidget(), 0, 1)
-        grid.addWidget(self.missing_label.parentWidget(), 1, 0, 1, 2)
-
-        stats_layout.addLayout(grid)
-        outer_layout.addWidget(stats_card)
+        main_layout.addWidget(stats_panel)
 
         actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
         actions_row.addStretch(1)
 
         self.export_btn = QPushButton("Export Missing Trace IDs")
-        self.export_btn.setObjectName("accentButton")
+        self.export_btn.setObjectName("exportButton")
         self.export_btn.clicked.connect(self.export_missing)
         actions_row.addWidget(self.export_btn)
 
-        outer_layout.addLayout(actions_row)
-        outer_layout.addStretch(1)
+        main_layout.addLayout(actions_row)
+        main_layout.addStretch(1)
 
-        self.setCentralWidget(root)
-
-    def _create_metric_card(self, title, value):
-        card = QFrame()
-        card.setObjectName("metricCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(8)
-
-        heading = QLabel(title)
-        heading.setObjectName("metricTitle")
-        layout.addWidget(heading)
-
-        label = QLabel(value)
-        label.setObjectName("metricValue")
-        label.setWordWrap(True)
-        layout.addWidget(label)
-
-        return label
+        scroll_area.setWidget(container)
+        self.setCentralWidget(scroll_area)
 
     def _apply_styles(self):
         self.setStyleSheet(
             """
             QMainWindow {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 1,
-                    stop: 0 #07111f,
-                    stop: 0.45 #0f2740,
-                    stop: 1 #16385a
-                );
+                background-color: #f3f6fb;
+            }
+            QScrollArea {
+                background-color: #f3f6fb;
+                border: none;
             }
             QWidget {
-                color: #f3f7fb;
+                color: #213547;
                 font-family: "Segoe UI";
                 font-size: 13px;
             }
-            QFrame#heroCard {
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 1, y2: 1,
-                    stop: 0 rgba(255, 255, 255, 0.13),
-                    stop: 1 rgba(255, 255, 255, 0.06)
-                );
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 24px;
-            }
-            QFrame#panelCard, QFrame#metricCard {
-                background-color: rgba(6, 18, 31, 0.72);
-                border: 1px solid rgba(165, 210, 255, 0.16);
-                border-radius: 20px;
-            }
-            QLabel#eyebrow {
-                color: #9fd0ff;
-                font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 1.8px;
-            }
             QLabel#titleLabel {
-                font-size: 30px;
+                font-size: 24px;
                 font-weight: 700;
-                color: #ffffff;
+                color: #1d3557;
             }
             QLabel#subtitleLabel {
-                color: #c9d8e7;
-                font-size: 14px;
+                color: #4f6478;
+                font-size: 13px;
             }
-            QLabel#statusBanner {
-                background-color: rgba(82, 172, 255, 0.12);
-                border: 1px solid rgba(124, 196, 255, 0.22);
-                border-radius: 14px;
-                padding: 12px 14px;
-                color: #f4fbff;
-                font-weight: 600;
+            QLabel#statusLabel {
+                background-color: #e7f0fb;
+                border: 1px solid #c8dbf1;
+                border-radius: 8px;
+                padding: 8px 10px;
+                color: #27496d;
             }
-            QLabel#sectionTitle {
-                font-size: 16px;
-                font-weight: 700;
-                color: #ffffff;
+            QFrame#panel {
+                background-color: #ffffff;
+                border: 1px solid #d7e1ec;
+                border-radius: 10px;
             }
-            QLabel#mutedLabel {
-                color: #c1d0de;
-                padding: 4px 0;
+            QLabel#fileLabel {
+                color: #55697d;
             }
             QLabel#helperLabel {
-                color: #8fb8dc;
+                color: #6a7f94;
                 font-size: 12px;
             }
-            QLabel#metricTitle {
-                color: #8ab6db;
-                font-size: 12px;
-                font-weight: 700;
-                letter-spacing: 0.4px;
-            }
-            QLabel#metricValue {
-                color: #ffffff;
-                font-size: 19px;
-                font-weight: 700;
+            QLabel#statsLabel {
+                color: #213547;
+                font-size: 14px;
+                padding: 2px 0;
             }
             QLineEdit, QComboBox {
-                background-color: rgba(255, 255, 255, 0.08);
-                border: 1px solid rgba(176, 215, 255, 0.18);
-                border-radius: 14px;
-                padding: 11px 14px;
-                selection-background-color: #ff9f43;
-            }
-            QLineEdit:focus, QComboBox:focus {
-                border: 1px solid #ffb660;
-                background-color: rgba(255, 255, 255, 0.12);
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 28px;
+                background-color: #ffffff;
+                border: 1px solid #c9d5e2;
+                border-radius: 8px;
+                padding: 8px 10px;
+                min-height: 20px;
             }
             QComboBox QAbstractItemView {
-                background-color: #0f2338;
-                border: 1px solid rgba(176, 215, 255, 0.22);
-                selection-background-color: #ff9f43;
-                selection-color: #0d1117;
+                min-height: 120px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #5b8def;
             }
             QPushButton {
                 border: none;
-                border-radius: 14px;
-                padding: 12px 18px;
-                font-weight: 700;
+                border-radius: 8px;
+                padding: 8px 14px;
+                font-weight: 600;
+                min-height: 20px;
             }
-            QPushButton#primaryButton {
-                background-color: #ff9f43;
-                color: #152031;
+            QPushButton#importButton {
+                background-color: #4c8bf5;
+                color: white;
             }
-            QPushButton#primaryButton:hover {
-                background-color: #ffb45c;
+            QPushButton#importButton:hover {
+                background-color: #3d7ce7;
             }
-            QPushButton#primaryButton:pressed {
-                background-color: #ea8e34;
+            QPushButton#exportButton {
+                background-color: #35a86b;
+                color: white;
             }
-            QPushButton#accentButton {
-                background-color: #3fc1a2;
-                color: #082119;
-            }
-            QPushButton#accentButton:hover {
-                background-color: #5ed2b5;
-            }
-            QPushButton#accentButton:pressed {
-                background-color: #30a88a;
+            QPushButton#exportButton:hover {
+                background-color: #2e975f;
             }
             QPushButton:disabled {
-                background-color: rgba(255, 255, 255, 0.14);
-                color: rgba(255, 255, 255, 0.44);
+                background-color: #c7d2df;
+                color: #6f7f91;
             }
             """
         )
+
+    def _set_status(self, message):
+        self.status.setText(message)
 
     def _refresh_actions(self):
         has_data = self.df is not None and not self.df.empty
         has_column = bool(self.column_box.currentText().strip())
         self.export_btn.setEnabled(has_data and has_column)
-
-    def _set_status(self, message):
-        self.status.setText(message)
 
     def auto_detect_trace_column(self):
         for col in self.df.columns:
@@ -346,7 +254,7 @@ class MainWindow(QMainWindow):
 
         if not value.isdigit() or int(value) <= 0:
             self.expected_input.setStyleSheet(
-                "border: 1px solid #ff7b7b; background-color: rgba(255, 123, 123, 0.08);"
+                "border: 1px solid #d9534f; background-color: #fff3f2;"
             )
             return False
 
@@ -360,15 +268,14 @@ class MainWindow(QMainWindow):
         data = self.df[column].dropna().astype(str)
 
         if data.empty or not data.str.contains(r"TMGID\d+", regex=True).any():
-            self.records_label.setText("No Trace IDs found in the selected column.")
-            self.last_label.setText("Choose a different column to continue.")
-            self.missing_label.setText("Missing IDs cannot be calculated yet.")
+            self.records_label.setText("Records scanned: -")
+            self.last_label.setText("Last Trace ID: -")
+            self.missing_label.setText("Missing IDs: -")
             self.missing = []
             self._refresh_actions()
             return False
 
         numbers = extract_numbers(self.df[column])
-
         if not numbers:
             return False
 
@@ -378,9 +285,9 @@ class MainWindow(QMainWindow):
 
         self.missing = find_missing(numbers, max_range)
 
-        self.records_label.setText(f"{len(self.df):,} rows scanned")
-        self.last_label.setText(f"TMGID{last_id:06d}")
-        self.missing_label.setText(f"{len(self.missing):,} missing IDs detected")
+        self.records_label.setText(f"Records scanned: {len(self.df):,}")
+        self.last_label.setText(f"Last Trace ID: TMGID{last_id:06d}")
+        self.missing_label.setText(f"Missing IDs: {len(self.missing):,}")
         self._refresh_actions()
         return True
 
@@ -390,18 +297,16 @@ class MainWindow(QMainWindow):
             return
 
         column = self.column_box.currentText().strip()
-        if not column:
-            self._refresh_actions()
-            return
-
-        self.calculate_stats(column)
+        if column:
+            self.calculate_stats(column)
+        self._refresh_actions()
 
     def expected_changed(self):
         if self.df is None:
             return
 
         if not self.validate_expected():
-            self._set_status("Expected total must be a positive whole number.")
+            self._set_status("Expected total record count must be a positive whole number.")
             self._refresh_actions()
             return
 
@@ -436,10 +341,9 @@ class MainWindow(QMainWindow):
             return
 
         self.df = df
-        self.loaded_file = file_path
         self.missing = []
-
         self.file_label.setText(file_path)
+
         self.column_box.blockSignals(True)
         self.column_box.clear()
         self.column_box.addItems([str(column) for column in self.df.columns])
@@ -450,16 +354,14 @@ class MainWindow(QMainWindow):
         if auto_col:
             index = self.column_box.findText(auto_col)
             self.column_box.setCurrentIndex(index)
-            self._set_status(
-                f"Loaded {len(self.df):,} rows from the selected file. Trace ID column auto-detected."
-            )
+            self._set_status(f"Loaded {len(self.df):,} rows. Trace ID column auto-detected.")
             self.calculate_stats(auto_col)
         else:
-            self.records_label.setText(f"{len(self.df):,} rows loaded")
-            self.last_label.setText("Select the Trace ID column.")
-            self.missing_label.setText("Missing IDs will appear after column selection.")
+            self.records_label.setText(f"Records scanned: {len(self.df):,}")
+            self.last_label.setText("Last Trace ID: -")
+            self.missing_label.setText("Missing IDs: -")
             self._set_status(
-                f"Loaded {len(self.df):,} rows. Select the column that contains Trace IDs."
+                f"Loaded {len(self.df):,} rows. Please select the Trace ID column."
             )
 
         self._refresh_actions()
@@ -473,7 +375,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Invalid Input",
-                "Expected total must be a positive whole number.",
+                "Expected total record count must be a positive whole number.",
             )
             return
 
@@ -484,7 +386,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Invalid Column",
-                "The selected column does not appear to contain Trace IDs.",
+                "Selected column does not contain Trace IDs.",
             )
             return
 
