@@ -2,14 +2,19 @@
 **/__pycache__/
 *.py[cod]
 *$py.class
+*.pyo
+*.pyd
 
 venv/
 .venv/
 env/
+ENV/
 
 build/
 dist/
 dist/**
+*.egg-info/
+.Python
 *.spec.bak
 
 .pytest_cache/
@@ -22,6 +27,10 @@ dist/**
 data/*.csv
 data/*.xlsx
 data/*.xls
+data/**/*.csv
+data/**/*.xlsx
+data/**/*.xls
 
 Thumbs.db
 Desktop.ini
+.DS_Store
