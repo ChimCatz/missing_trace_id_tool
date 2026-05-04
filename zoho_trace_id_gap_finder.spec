@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='zoho_trace_id_gap_finder',
+    name='Missing Trace and Company ID Tool',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
