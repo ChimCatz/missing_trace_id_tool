@@ -3,6 +3,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -16,22 +18,64 @@ from PySide6.QtWidgets import (
 
 import pandas as pd
 
-from trace_logic import extract_numbers, find_missing
+from trace_logic import analyze_identifier_series, find_missing_ids, has_identifier_values
+
+
+PIPELINES = {
+    "trace": {
+        "title": "Trace ID",
+        "prefix": "TMGID",
+        "digits": 6,
+        "start_number": 1,
+        "exact_headers": ("trace id",),
+        "header_keywords": ("trace",),
+        "column_placeholder": "Select or type the Trace ID column",
+        "expected_placeholder": "Expected total Trace ID count (optional)",
+        "missing_column_name": "Missing Trace IDs",
+        "last_label": "Last Trace ID",
+        "panel_property": "trace",
+    },
+    "company": {
+        "title": "Company ID",
+        "prefix": "ACC",
+        "digits": 6,
+        "start_number": 0,
+        "exact_headers": ("company id", "cid"),
+        "header_keywords": ("company", "cid"),
+        "column_placeholder": "Select or type the Company ID column",
+        "expected_placeholder": "Expected total Company ID count (optional)",
+        "missing_column_name": "Missing Company IDs",
+        "last_label": "Last Company ID",
+        "panel_property": "company",
+    },
+}
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Missing Trace ID Tool v2")
-        self.resize(760, 500)
-        self.setMinimumSize(700, 460)
+        self.setWindowTitle("Missing Trace ID and Company ID Tool")
+        self.resize(940, 620)
+        self.setMinimumSize(860, 560)
 
         self.df = None
-        self.missing = []
+        self.pipeline_state = {
+            key: {
+                "missing": [],
+                "enabled": False,
+                "valid": False,
+                "auto_selected": False,
+            }
+            for key in PIPELINES
+        }
+        self.pipeline_widgets = {}
+        self.stats_labels = {}
 
         self._build_ui()
         self._apply_styles()
+        for pipeline_key in PIPELINES:
+            self._set_pipeline_enabled(pipeline_key, False)
         self._refresh_actions()
 
     def _build_ui(self):
@@ -43,14 +87,15 @@ class MainWindow(QMainWindow):
         container = QWidget()
         main_layout = QVBoxLayout(container)
         main_layout.setContentsMargins(20, 18, 20, 18)
-        main_layout.setSpacing(10)
+        main_layout.setSpacing(12)
 
-        title = QLabel("Missing Trace ID Finder")
+        title = QLabel("Missing Trace ID and Company ID Tool")
         title.setObjectName("titleLabel")
         main_layout.addWidget(title)
 
         subtitle = QLabel(
-            "Import a CSV file, select the Trace ID column, and export missing IDs."
+            "Import a CSV file, select the Trace ID and/or Company ID column, "
+            "and export missing IDs."
         )
         subtitle.setObjectName("subtitleLabel")
         subtitle.setWordWrap(True)
@@ -65,7 +110,7 @@ class MainWindow(QMainWindow):
         file_panel.setObjectName("panel")
         file_layout = QVBoxLayout(file_panel)
         file_layout.setContentsMargins(14, 14, 14, 14)
-        file_layout.setSpacing(8)
+        file_layout.setSpacing(12)
 
         import_row = QHBoxLayout()
         import_row.setSpacing(10)
@@ -82,22 +127,26 @@ class MainWindow(QMainWindow):
 
         file_layout.addLayout(import_row)
 
-        self.column_box = QComboBox()
-        self.column_box.setEditable(True)
-        self.column_box.lineEdit().setAlignment(Qt.AlignLeft)
-        self.column_box.lineEdit().setPlaceholderText("Select or type the Trace ID column")
-        self.column_box.currentTextChanged.connect(self.column_changed)
-        file_layout.addWidget(self.column_box)
+        pipeline_grid = QGridLayout()
+        pipeline_grid.setHorizontalSpacing(14)
+        pipeline_grid.setVerticalSpacing(10)
 
-        self.expected_input = QLineEdit()
-        self.expected_input.setPlaceholderText(
-            "Expected total record count (optional)"
-        )
-        self.expected_input.textChanged.connect(self.expected_changed)
-        file_layout.addWidget(self.expected_input)
+        trace_header = QLabel("Trace ID Pipeline")
+        trace_header.setObjectName("sectionLabel")
+        company_header = QLabel("Company ID Pipeline")
+        company_header.setObjectName("sectionLabel")
+        pipeline_grid.addWidget(trace_header, 0, 0)
+        pipeline_grid.addWidget(company_header, 0, 1)
+
+        for column_index, pipeline_key in enumerate(("trace", "company")):
+            section = self._build_pipeline_section(pipeline_key)
+            pipeline_grid.addWidget(section, 1, column_index)
+
+        file_layout.addLayout(pipeline_grid)
 
         helper = QLabel(
-            "Only enter the expected total if you know the exact number of records."
+            "Only enter expected totals when you know the exact upper bound for "
+            "that ID series."
         )
         helper.setObjectName("helperLabel")
         helper.setWordWrap(True)
@@ -107,25 +156,39 @@ class MainWindow(QMainWindow):
 
         stats_panel = QFrame()
         stats_panel.setObjectName("panel")
-        stats_layout = QVBoxLayout(stats_panel)
+        stats_layout = QGridLayout(stats_panel)
         stats_layout.setContentsMargins(14, 14, 14, 14)
-        stats_layout.setSpacing(6)
+        stats_layout.setHorizontalSpacing(18)
+        stats_layout.setVerticalSpacing(8)
 
-        self.records_label = QLabel("Records scanned: -")
-        self.last_label = QLabel("Last Trace ID: -")
-        self.missing_label = QLabel("Missing IDs: -")
+        stats_layout.addWidget(self._make_stats_header(""), 0, 0)
+        stats_layout.addWidget(self._make_stats_header("Trace ID"), 0, 1)
+        stats_layout.addWidget(self._make_stats_header("Company ID"), 0, 2)
 
-        for label in (self.records_label, self.last_label, self.missing_label):
-            label.setObjectName("statsLabel")
-            label.setWordWrap(True)
-            stats_layout.addWidget(label)
+        row_titles = (
+            ("records", "Records scanned:"),
+            ("last", "Last detected ID:"),
+            ("missing", "Missing IDs:"),
+        )
+
+        for row_index, (label_key, title_text) in enumerate(row_titles, start=1):
+            label = QLabel(title_text)
+            label.setObjectName("statsTitleLabel")
+            stats_layout.addWidget(label, row_index, 0)
+
+            for column_index, pipeline_key in enumerate(("trace", "company"), start=1):
+                stats_value = QLabel("-")
+                stats_value.setObjectName("statsValueLabel")
+                stats_value.setWordWrap(True)
+                stats_layout.addWidget(stats_value, row_index, column_index)
+                self.stats_labels[(pipeline_key, label_key)] = stats_value
 
         main_layout.addWidget(stats_panel)
 
         actions_row = QHBoxLayout()
         actions_row.addStretch(1)
 
-        self.export_btn = QPushButton("Export Missing Trace IDs")
+        self.export_btn = QPushButton("Export Missing IDs")
         self.export_btn.setObjectName("exportButton")
         self.export_btn.clicked.connect(self.export_missing)
         actions_row.addWidget(self.export_btn)
@@ -135,6 +198,73 @@ class MainWindow(QMainWindow):
 
         scroll_area.setWidget(container)
         self.setCentralWidget(scroll_area)
+
+    def _build_pipeline_section(self, pipeline_key):
+        config = PIPELINES[pipeline_key]
+
+        section = QFrame()
+        section.setObjectName("subPanel")
+        section.setProperty("pipelineType", config["panel_property"])
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
+        include_btn = QPushButton("Include")
+        include_btn.setObjectName("includeButton")
+        include_btn.setCheckable(True)
+        include_btn.clicked.connect(
+            lambda checked, key=pipeline_key: self.toggle_pipeline(key, checked)
+        )
+        top_row.addWidget(include_btn, 0)
+
+        state_label = QLabel("Not included")
+        state_label.setObjectName("pipelineStateLabel")
+        top_row.addWidget(state_label, 0)
+
+        top_row.addStretch(1)
+        layout.addLayout(top_row)
+
+        inputs_container = QWidget()
+        inputs_layout = QVBoxLayout(inputs_container)
+        inputs_layout.setContentsMargins(0, 0, 0, 0)
+        inputs_layout.setSpacing(8)
+
+        column_box = QComboBox()
+        column_box.setEditable(True)
+        column_box.lineEdit().setAlignment(Qt.AlignLeft)
+        column_box.lineEdit().setPlaceholderText(config["column_placeholder"])
+        column_box.currentTextChanged.connect(
+            lambda _text, key=pipeline_key: self.column_changed(key)
+        )
+        inputs_layout.addWidget(column_box)
+
+        expected_input = QLineEdit()
+        expected_input.setPlaceholderText(config["expected_placeholder"])
+        expected_input.textChanged.connect(
+            lambda _text, key=pipeline_key: self.expected_changed(key)
+        )
+        inputs_layout.addWidget(expected_input)
+
+        layout.addWidget(inputs_container)
+
+        self.pipeline_widgets[pipeline_key] = {
+            "section": section,
+            "include_btn": include_btn,
+            "state_label": state_label,
+            "inputs_container": inputs_container,
+            "column_box": column_box,
+            "expected_input": expected_input,
+        }
+
+        return section
+
+    def _make_stats_header(self, text):
+        label = QLabel(text)
+        label.setObjectName("statsHeaderLabel")
+        return label
 
     def _apply_styles(self):
         self.setStyleSheet(
@@ -172,6 +302,16 @@ class MainWindow(QMainWindow):
                 border: 1px solid #d7e1ec;
                 border-radius: 10px;
             }
+            QFrame#subPanel[pipelineType="trace"] {
+                background-color: #eef6ff;
+                border: 1px solid #cfe0f5;
+                border-radius: 10px;
+            }
+            QFrame#subPanel[pipelineType="company"] {
+                background-color: #eefaf2;
+                border: 1px solid #cfe8d6;
+                border-radius: 10px;
+            }
             QLabel#fileLabel {
                 color: #55697d;
             }
@@ -179,10 +319,30 @@ class MainWindow(QMainWindow):
                 color: #6a7f94;
                 font-size: 12px;
             }
-            QLabel#statsLabel {
+            QLabel#sectionLabel {
+                color: #1d3557;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QLabel#pipelineStateLabel {
+                color: #5f7488;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QLabel#statsHeaderLabel {
+                color: #1d3557;
+                font-size: 14px;
+                font-weight: 700;
+                padding-bottom: 4px;
+            }
+            QLabel#statsTitleLabel {
+                color: #4f6478;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#statsValueLabel {
                 color: #213547;
                 font-size: 14px;
-                padding: 2px 0;
             }
             QLineEdit, QComboBox {
                 background-color: #ffffff;
@@ -218,6 +378,16 @@ class MainWindow(QMainWindow):
             QPushButton#exportButton:hover {
                 background-color: #2e975f;
             }
+            QPushButton#includeButton {
+                background-color: #d4dee8;
+                color: #284058;
+                min-width: 74px;
+                padding: 6px 10px;
+            }
+            QPushButton#includeButton:checked {
+                background-color: #4c8bf5;
+                color: white;
+            }
             QPushButton:disabled {
                 background-color: #c7d2df;
                 color: #6f7f91;
@@ -230,93 +400,240 @@ class MainWindow(QMainWindow):
 
     def _refresh_actions(self):
         has_data = self.df is not None and not self.df.empty
-        has_column = bool(self.column_box.currentText().strip())
-        self.export_btn.setEnabled(has_data and has_column)
+        has_enabled_pipeline = any(
+            self.pipeline_state[key]["enabled"] for key in PIPELINES
+        )
+        self.export_btn.setEnabled(has_data and has_enabled_pipeline)
 
-    def auto_detect_trace_column(self):
-        for col in self.df.columns:
-            if "trace" in col.lower():
-                return col
+    def _reset_pipeline_stats(self, pipeline_key):
+        self.pipeline_state[pipeline_key]["missing"] = []
+        self.pipeline_state[pipeline_key]["valid"] = False
+        self.stats_labels[(pipeline_key, "records")].setText("-")
+        self.stats_labels[(pipeline_key, "last")].setText("-")
+        self.stats_labels[(pipeline_key, "missing")].setText("-")
 
-        for col in self.df.columns:
-            sample = self.df[col].dropna().astype(str).head(20)
-            if sample.str.contains(r"TMGID\d+", regex=True).any():
-                return col
+    def _set_pipeline_enabled(self, pipeline_key, enabled):
+        widgets = self.pipeline_widgets[pipeline_key]
+        self.pipeline_state[pipeline_key]["enabled"] = enabled
+        widgets["include_btn"].blockSignals(True)
+        widgets["include_btn"].setChecked(enabled)
+        widgets["include_btn"].blockSignals(False)
+        widgets["include_btn"].setText("Included" if enabled else "Include")
+        widgets["state_label"].setText("Included" if enabled else "Not included")
+        widgets["column_box"].setEnabled(enabled)
+        widgets["expected_input"].setEnabled(enabled)
+
+        opacity_effect = widgets["inputs_container"].graphicsEffect()
+        if opacity_effect is None:
+            opacity_effect = QGraphicsOpacityEffect(widgets["inputs_container"])
+            widgets["inputs_container"].setGraphicsEffect(opacity_effect)
+        opacity_effect.setOpacity(1.0 if enabled else 0.35)
+
+        if not enabled:
+            self._reset_pipeline_stats(pipeline_key)
+        self._refresh_actions()
+
+    def _populate_column_boxes(self):
+        column_names = [str(column) for column in self.df.columns]
+        for pipeline_key in PIPELINES:
+            column_box = self.pipeline_widgets[pipeline_key]["column_box"]
+            column_box.blockSignals(True)
+            column_box.clear()
+            column_box.addItems(column_names)
+            column_box.blockSignals(False)
+
+    def _match_status_message(self):
+        found = [
+            PIPELINES[key]["title"]
+            for key in PIPELINES
+            if self.pipeline_state[key]["auto_selected"]
+        ]
+        enabled = [
+            PIPELINES[key]["title"]
+            for key in PIPELINES
+            if self.pipeline_state[key]["enabled"]
+        ]
+
+        if len(found) == 2:
+            return "Loaded CSV. Trace ID and Company ID columns auto-selected."
+        if len(found) == 1:
+            return f"Loaded CSV. {found[0]} column auto-selected."
+        if enabled:
+            return "Loaded CSV. Select the Trace ID and/or Company ID columns to continue."
+        return "Loaded CSV. Enable a pipeline to manually choose a column."
+
+    def auto_detect_column(self, pipeline_key):
+        config = PIPELINES[pipeline_key]
+        normalized_columns = [(str(column), str(column).strip().lower()) for column in self.df.columns]
+
+        for original, normalized in normalized_columns:
+            if normalized in config["exact_headers"]:
+                return original
+
+        for original, normalized in normalized_columns:
+            if any(keyword in normalized for keyword in config["header_keywords"]):
+                return original
+
+        for column in self.df.columns:
+            if has_identifier_values(
+                self.df[column],
+                config["prefix"],
+                config["digits"],
+            ):
+                return str(column)
 
         return None
 
-    def validate_expected(self):
-        value = self.expected_input.text().strip()
+    def validate_expected(self, pipeline_key):
+        expected_input = self.pipeline_widgets[pipeline_key]["expected_input"]
+        value = expected_input.text().strip()
 
         if value == "":
-            self.expected_input.setStyleSheet("")
+            expected_input.setStyleSheet("")
             return True
 
-        if not value.isdigit() or int(value) <= 0:
-            self.expected_input.setStyleSheet(
+        if not value.isdigit() or int(value) < 0:
+            expected_input.setStyleSheet(
                 "border: 1px solid #d9534f; background-color: #fff3f2;"
             )
             return False
 
-        self.expected_input.setStyleSheet("")
-        return True
-
-    def calculate_stats(self, column):
-        if self.df is None or column not in self.df.columns:
+        if pipeline_key == "trace" and int(value) == 0:
+            expected_input.setStyleSheet(
+                "border: 1px solid #d9534f; background-color: #fff3f2;"
+            )
             return False
 
-        data = self.df[column].dropna().astype(str)
+        expected_input.setStyleSheet("")
+        return True
 
-        if data.empty or not data.str.contains(r"TMGID\d+", regex=True).any():
-            self.records_label.setText("Records scanned: -")
-            self.last_label.setText("Last Trace ID: -")
-            self.missing_label.setText("Missing IDs: -")
-            self.missing = []
+    def validate_selected_column(self, pipeline_key, show_error=False):
+        config = PIPELINES[pipeline_key]
+
+        if not self.pipeline_state[pipeline_key]["enabled"]:
+            self._reset_pipeline_stats(pipeline_key)
             self._refresh_actions()
             return False
 
-        numbers = extract_numbers(self.df[column])
-        if not numbers:
+        column = self.pipeline_widgets[pipeline_key]["column_box"].currentText().strip()
+
+        if self.df is None or column == "":
+            self._reset_pipeline_stats(pipeline_key)
+            self._refresh_actions()
             return False
 
-        last_id = max(numbers)
-        expected = self.expected_input.text().strip()
-        max_range = max(last_id, int(expected)) if expected.isdigit() else last_id
+        if column not in self.df.columns:
+            self._reset_pipeline_stats(pipeline_key)
+            if show_error:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Column",
+                    f"Selected column for {config['title']} was not found in the CSV.",
+                )
+            self._refresh_actions()
+            return False
 
-        self.missing = find_missing(numbers, max_range)
+        analysis = analyze_identifier_series(
+            self.df[column],
+            config["prefix"],
+            config["digits"],
+        )
 
-        self.records_label.setText(f"Records scanned: {len(self.df):,}")
-        self.last_label.setText(f"Last Trace ID: TMGID{last_id:06d}")
-        self.missing_label.setText(f"Missing IDs: {len(self.missing):,}")
+        total_values = analysis["total_values"]
+        match_count = analysis["match_count"]
+
+        if total_values == 0 or match_count == 0 or (match_count / total_values) < 0.5:
+            self._reset_pipeline_stats(pipeline_key)
+            if show_error:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Column",
+                    f"Selected column for {config['title']} does not mostly start "
+                    f"with {config['prefix']}.",
+                )
+            self._refresh_actions()
+            return False
+
+        last_id = max(analysis["numbers"])
+        expected_text = self.pipeline_widgets[pipeline_key]["expected_input"].text().strip()
+        max_range = max(last_id, int(expected_text)) if expected_text.isdigit() else last_id
+
+        self.pipeline_state[pipeline_key]["missing"] = find_missing_ids(
+            analysis["numbers"],
+            config["start_number"],
+            max_range,
+            config["prefix"],
+            config["digits"],
+        )
+        self.pipeline_state[pipeline_key]["valid"] = True
+
+        self.stats_labels[(pipeline_key, "records")].setText(f"{len(self.df):,}")
+        self.stats_labels[(pipeline_key, "last")].setText(
+            f"{config['prefix']}{last_id:0{config['digits']}d}"
+        )
+        self.stats_labels[(pipeline_key, "missing")].setText(
+            f"{len(self.pipeline_state[pipeline_key]['missing']):,}"
+        )
         self._refresh_actions()
         return True
 
-    def column_changed(self):
+    def toggle_pipeline(self, pipeline_key, checked):
+        if self.df is None:
+            self.pipeline_widgets[pipeline_key]["include_btn"].blockSignals(True)
+            self.pipeline_widgets[pipeline_key]["include_btn"].setChecked(False)
+            self.pipeline_widgets[pipeline_key]["include_btn"].blockSignals(False)
+            return
+
+        self._set_pipeline_enabled(pipeline_key, checked)
+        if checked:
+            column = self.pipeline_widgets[pipeline_key]["column_box"].currentText().strip()
+            if column:
+                self.validate_selected_column(pipeline_key, show_error=False)
+        self._set_status(self._match_status_message())
+
+    def column_changed(self, pipeline_key):
         if self.df is None:
             self._refresh_actions()
             return
 
-        column = self.column_box.currentText().strip()
-        if column:
-            self.calculate_stats(column)
-        self._refresh_actions()
-
-    def expected_changed(self):
-        if self.df is None:
-            return
-
-        if not self.validate_expected():
-            self._set_status("Expected total record count must be a positive whole number.")
+        if not self.pipeline_state[pipeline_key]["enabled"]:
             self._refresh_actions()
             return
 
-        column = self.column_box.currentText().strip()
+        column = self.pipeline_widgets[pipeline_key]["column_box"].currentText().strip()
         if column:
-            self.calculate_stats(column)
+            self.validate_selected_column(pipeline_key, show_error=False)
+        else:
+            self._reset_pipeline_stats(pipeline_key)
+        self._refresh_actions()
+
+    def expected_changed(self, pipeline_key):
+        if self.df is None:
+            return
+
+        if not self.pipeline_state[pipeline_key]["enabled"]:
+            return
+
+        config = PIPELINES[pipeline_key]
+        if not self.validate_expected(pipeline_key):
+            self.pipeline_state[pipeline_key]["valid"] = False
+            self._set_status(
+                f"Expected {config['title']} count must be a valid whole number."
+            )
+            self._refresh_actions()
+            return
+
+        column = self.pipeline_widgets[pipeline_key]["column_box"].currentText().strip()
+        if column:
+            self.validate_selected_column(pipeline_key, show_error=False)
+            self._set_status(self._match_status_message())
 
     def import_csv(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select CSV", "", "CSV Files (*.csv)"
+            self,
+            "Select CSV",
+            "",
+            "CSV Files (*.csv)",
         )
 
         if not file_path:
@@ -341,72 +658,137 @@ class MainWindow(QMainWindow):
             return
 
         self.df = df
-        self.missing = []
         self.file_label.setText(file_path)
+        self._populate_column_boxes()
 
-        self.column_box.blockSignals(True)
-        self.column_box.clear()
-        self.column_box.addItems([str(column) for column in self.df.columns])
-        self.column_box.blockSignals(False)
+        for pipeline_key in PIPELINES:
+            self.pipeline_state[pipeline_key]["missing"] = []
+            self.pipeline_state[pipeline_key]["enabled"] = False
+            self.pipeline_state[pipeline_key]["valid"] = False
+            self.pipeline_state[pipeline_key]["auto_selected"] = False
+            self.pipeline_widgets[pipeline_key]["column_box"].setCurrentText("")
+            self.pipeline_widgets[pipeline_key]["expected_input"].clear()
+            self.pipeline_widgets[pipeline_key]["expected_input"].setStyleSheet("")
+            self._reset_pipeline_stats(pipeline_key)
+            self._set_pipeline_enabled(pipeline_key, False)
 
-        auto_col = self.auto_detect_trace_column()
+        for pipeline_key in PIPELINES:
+            auto_col = self.auto_detect_column(pipeline_key)
+            column_box = self.pipeline_widgets[pipeline_key]["column_box"]
+            if auto_col:
+                self.pipeline_state[pipeline_key]["auto_selected"] = True
+                self._set_pipeline_enabled(pipeline_key, True)
+                index = column_box.findText(auto_col)
+                column_box.setCurrentIndex(index)
+                self.validate_selected_column(pipeline_key, show_error=False)
 
-        if auto_col:
-            index = self.column_box.findText(auto_col)
-            self.column_box.setCurrentIndex(index)
-            self._set_status(f"Loaded {len(self.df):,} rows. Trace ID column auto-detected.")
-            self.calculate_stats(auto_col)
-        else:
-            self.records_label.setText(f"Records scanned: {len(self.df):,}")
-            self.last_label.setText("Last Trace ID: -")
-            self.missing_label.setText("Missing IDs: -")
-            self._set_status(
-                f"Loaded {len(self.df):,} rows. Please select the Trace ID column."
-            )
-
+        self._set_status(self._match_status_message())
         self._refresh_actions()
+
+    def _validate_active_pipelines(self):
+        enabled_pipelines = [
+            key for key in PIPELINES if self.pipeline_state[key]["enabled"]
+        ]
+
+        if not enabled_pipelines:
+            QMessageBox.warning(
+                self,
+                "No Pipeline Selected",
+                "Please select a pipeline to continue.",
+            )
+            return None
+
+        valid_pipelines = []
+
+        for pipeline_key, config in PIPELINES.items():
+            if not self.pipeline_state[pipeline_key]["enabled"]:
+                continue
+
+            column = self.pipeline_widgets[pipeline_key]["column_box"].currentText().strip()
+            if not column:
+                QMessageBox.warning(
+                    self,
+                    "Missing Column Selection",
+                    f"Select a column for {config['title']} before exporting.",
+                )
+                return None
+
+            if column not in self.df.columns:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Column",
+                    f"Selected column for {config['title']} was not found in the CSV.",
+                )
+                return None
+
+            if not self.validate_selected_column(pipeline_key, show_error=True):
+                return None
+
+            if not self.pipeline_state[pipeline_key]["valid"]:
+                continue
+
+            if not self.validate_expected(pipeline_key):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Input",
+                    f"Expected {config['title']} count must be a valid whole number.",
+                )
+                return None
+
+            valid_pipelines.append(pipeline_key)
+
+        if valid_pipelines:
+            return valid_pipelines
+
+        QMessageBox.warning(
+            self,
+            "No Valid Pipelines",
+            "Please select at least one valid enabled pipeline first.",
+        )
+        return None
 
     def export_missing(self):
         if self.df is None:
             QMessageBox.warning(self, "No File", "Import a CSV file first.")
             return
 
-        if not self.validate_expected():
-            QMessageBox.warning(
-                self,
-                "Invalid Input",
-                "Expected total record count must be a positive whole number.",
-            )
-            return
-
-        column = self.column_box.currentText().strip()
-        valid = self.calculate_stats(column)
-
-        if not valid:
-            QMessageBox.warning(
-                self,
-                "Invalid Column",
-                "Selected column does not contain Trace IDs.",
-            )
+        valid_pipelines = self._validate_active_pipelines()
+        if not valid_pipelines:
             return
 
         save_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Missing Trace IDs",
-            "missing_trace_ids.csv",
+            "Save Missing IDs",
+            "missing_trace_and_company_ids.csv",
             "CSV Files (*.csv)",
         )
 
         if not save_path:
             return
 
+        output = {}
+        max_length = 0
+        for pipeline_key in valid_pipelines:
+            missing_ids = self.pipeline_state[pipeline_key]["missing"]
+            output[PIPELINES[pipeline_key]["missing_column_name"]] = missing_ids
+            max_length = max(max_length, len(missing_ids))
+
+        for column_name, values in list(output.items()):
+            output[column_name] = values + [""] * (max_length - len(values))
+
         try:
-            out = pd.DataFrame({"Missing Trace IDs": self.missing})
-            out.to_csv(save_path, index=False)
-            self._set_status(f"Exported {len(self.missing):,} missing Trace IDs.")
+            pd.DataFrame(output).to_csv(save_path, index=False)
+            exported_titles = ", ".join(PIPELINES[key]["title"] for key in valid_pipelines)
+            self._set_status(f"Exported missing IDs for {exported_titles}.")
         except PermissionError:
             QMessageBox.warning(
                 self,
                 "File Locked",
                 "Close the CSV file if it is open in Excel, then try again.",
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Export Failed",
+                f"The CSV could not be saved.\n\n{exc}",
             )

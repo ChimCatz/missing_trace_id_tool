@@ -6,15 +6,15 @@ This file gives AI coding agents a compact map of the project so they can
 work with less unnecessary file reading and lower token usage.
 
 Primary goal of this repo:
-- Load a CSV of trace records
-- Detect the trace ID column
-- Find missing `TMGID######` values
+- Load a CSV of records
+- Detect Trace ID and Company ID columns
+- Find missing `TMGID######` and `ACC######` values
 - Export the missing IDs to a new CSV
 
 Near-term product direction:
-- Keep the existing trace workflow stable
-- Prepare the codebase for a second identifier pipeline for Company IDs
-- Prefer separating shared CSV workflow from identifier-specific rules
+- Keep shared CSV workflow stable
+- Support Trace ID and Company ID pipelines in the same interface
+- Prefer separating shared workflow from identifier-specific rules
 
 ## Fast Start
 
@@ -41,7 +41,7 @@ Usually skip these unless explicitly needed:
 - `main.py`: application entry point, creates `QApplication`, opens
   `MainWindow`
 - `main_window.py`: main PySide6 UI and most current app behavior
-- `trace_logic.py`: trace ID parsing and missing-ID calculation helpers
+- `trace_logic.py`: identifier parsing and missing-ID calculation helpers
 - `requirements.txt`: runtime dependencies
 - `zoho_trace_id_gap_finder.spec`: PyInstaller packaging config
 - `data/`: optional local input/output samples, not intended for git
@@ -52,32 +52,34 @@ Usually skip these unless explicitly needed:
 2. `MainWindow` builds the interface and wires UI events
 3. User imports a CSV
 4. App loads the CSV with `pandas.read_csv`
-5. App tries to auto-detect the trace column
+5. App tries to auto-detect Trace ID and Company ID columns
 6. `trace_logic.extract_numbers()` parses numeric portions from values
-7. `trace_logic.find_missing()` generates the missing `TMGID######` range
+7. `trace_logic.find_missing_ids()` generates the missing ID ranges
 8. User exports missing IDs as a CSV
 
 ## Current Behavior Notes
 
 - Trace IDs are expected to look like `TMGID000123`
-- Column auto-detection first checks column names containing `trace`
-- Fallback detection checks sample cell values for `TMGID\d+`
-- Missing IDs are calculated from `1` through the larger of:
-  - the highest detected trace ID
-  - the optional expected record count entered by the user
-- Export currently writes one column named `Missing Trace IDs`
+- Company IDs are expected to look like `ACC000123`
+- Column auto-detection first checks headers, then falls back to sample values
+- Trace missing IDs are calculated from `1` through the larger of:
+  - the highest detected Trace ID
+  - the optional expected Trace count entered by the user
+- Company missing IDs are calculated from `0` through the larger of:
+  - the highest detected Company ID
+  - the optional expected Company count entered by the user
+- Export writes one column per active pipeline
 
 ## Architecture Direction
 
-The project is still trace-specific today. When preparing for Company ID
-support:
+The project now supports Trace ID and Company ID workflows together. When
+extending it further:
 
 - keep shared CSV import/export orchestration in `main_window.py`
 - keep identifier parsing and gap rules outside the UI layer
-- avoid hard-coding new Company ID behavior directly into unrelated trace code
 - prefer small pipeline-specific helpers over one large mixed logic module
-- do not rename the current trace workflow unless the task explicitly requires
-  it
+- preserve current Trace ID and Company ID behavior unless the task explicitly
+  changes it
 
 ## Known Constraints
 
@@ -85,10 +87,7 @@ support:
 - `export_missing()` currently handles `PermissionError`, but broad export
   failures are not surfaced beyond that
 - `calculate_stats()` counts scanned records using total DataFrame rows, not
-  just valid trace-ID rows
-- `extract_numbers()` captures the first numeric group in a value, which is
-  fine for current `TMGID######` input but could misread other mixed-format
-  strings
+  just valid ID rows
 - There are no automated tests yet
 
 ## Editing Guidelines
@@ -98,10 +97,8 @@ support:
 - Avoid moving data-processing rules deeper into the UI layer
 - Preserve the current user flow unless the task explicitly changes UX
 - Favor small, readable methods over large multi-purpose handlers
-- Reuse the existing `TMGID` formatting convention:
-  `f"TMGID{number:06d}"`
-- If adding Company ID support later, isolate the new format rules instead of
-  weakening the current trace behavior
+- Reuse the current formatting conventions:
+  `f"TMGID{number:06d}"` and `f"ACC{number:06d}"`
 - Keep repository hygiene in place: ignore virtual environments, build output,
   caches, and local sample data
 
@@ -123,18 +120,17 @@ For packaging tasks:
 Recommended lightweight checks after changes:
 
 - Run: `python main.py`
-- Import a CSV with a valid `TMGID` column
-- Verify auto-detection picks the expected column
-- Verify missing IDs update when expected count changes
+- Import a CSV with valid `TMGID` and/or `ACC` columns
+- Verify auto-detection picks the expected columns
+- Verify missing IDs update when expected counts change
 - Verify export works to a writable CSV path
 
-If changing trace logic, also test:
+If changing ID logic, also test:
 - rows with blanks
 - rows without matching trace IDs
+- rows without matching company IDs
 - nonstandard column names
 - expected count smaller than largest detected ID
-
-If preparing shared logic for multiple ID types, also test:
 - the current trace workflow still behaves exactly the same
 - identifier-specific labels do not leak into the wrong workflow
 - export column names still match the active pipeline
@@ -152,8 +148,7 @@ If preparing shared logic for multiple ID types, also test:
 Useful future tasks:
 - add drag-and-drop CSV import
 - improve invalid-column and invalid-file feedback
-- support configurable trace prefixes beyond `TMGID`
-- extract a reusable ID-pipeline abstraction for Trace ID and Company ID flows
+- support configurable prefixes beyond `TMGID` and `ACC`
 - add automated tests for `trace_logic.py`
 - add sample anonymized test data
 - split UI styling and logic if the window keeps growing
