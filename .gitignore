@@ -1,9 +1,7 @@
-﻿__pycache__/
+__pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
-*.pyo
-*.pyd
 
 venv/
 .venv/
@@ -12,7 +10,6 @@ ENV/
 
 build/
 dist/
-dist/**
 *.egg-info/
 .Python
 *.spec.bak
