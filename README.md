@@ -1,7 +1,7 @@
 # Missing Trace ID Tool
 
-This project is a desktop CSV workflow for finding missing identifiers and
-exporting the gaps to a new CSV.
+This project is a desktop spreadsheet workflow for finding missing
+identifiers and exporting the gaps to a new CSV or Excel file.
 
 It currently supports two pipelines in the same interface:
 
@@ -10,12 +10,12 @@ It currently supports two pipelines in the same interface:
 
 ## Current Scope
 
-- Import a CSV file with record data
+- Import a CSV, TSV, or Excel file with record data
 - Auto-detect Trace ID and Company ID columns
 - Run either pipeline independently or both together
 - Accept optional expected totals for each ID type
 - Find missing `TMGID######` and `ACC######` values
-- Export the missing IDs to a CSV report
+- Export the missing IDs to a CSV or Excel report
 - Provide a simple PySide6 interface for non-technical users
 
 ## Detection Rules
@@ -58,17 +58,29 @@ python main.py
 
 ## Current Workflow
 
-1. Open the app and import a CSV file.
+1. Open the app and import a CSV, TSV, or Excel file.
 2. The app tries to auto-detect Trace ID and Company ID columns.
 3. It extracts the numeric part of each matching ID series.
 4. It finds missing values in each enabled pipeline.
 5. If an expected total is entered, the search range expands to that value.
-6. The app exports the missing IDs to a new CSV file.
+6. The app exports the missing IDs to a new CSV or Excel file.
 
 ## Packaging
 
 ```bash
 pyinstaller zoho_trace_id_gap_finder.spec
+```
+
+The current spec is configured for a one-file Windows build with no console
+window and uses `missing_id_icon.ico` as the executable icon. The output file
+name is `Missing Trace-Company ID Tool.exe` because Windows does not allow `/`
+in executable file names.
+
+If you regenerate the executable from the command line instead of the spec,
+use the equivalent options:
+
+```bash
+pyinstaller --onefile --windowed --name "Missing Trace-Company ID Tool" --icon missing_id_icon.ico main.py
 ```
 
 Build outputs are created in `build/` and `dist/`, which are ignored by git.

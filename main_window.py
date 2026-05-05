@@ -94,14 +94,14 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(title)
 
         subtitle = QLabel(
-            "Import a CSV file, select the Trace ID and/or Company ID column, "
-            "and export missing IDs."
+            "Import a CSV, TSV, or Excel file, select the Trace ID and/or "
+            "Company ID column, and export missing IDs."
         )
         subtitle.setObjectName("subtitleLabel")
         subtitle.setWordWrap(True)
         main_layout.addWidget(subtitle)
 
-        self.status = QLabel("Import CSV to begin.")
+        self.status = QLabel("Import a CSV, TSV, or Excel file to begin.")
         self.status.setObjectName("statusLabel")
         self.status.setWordWrap(True)
         main_layout.addWidget(self.status)
@@ -115,7 +115,7 @@ class MainWindow(QMainWindow):
         import_row = QHBoxLayout()
         import_row.setSpacing(10)
 
-        self.import_btn = QPushButton("Import CSV")
+        self.import_btn = QPushButton("Import File")
         self.import_btn.setObjectName("importButton")
         self.import_btn.clicked.connect(self.import_csv)
         import_row.addWidget(self.import_btn, 0)
@@ -455,12 +455,53 @@ class MainWindow(QMainWindow):
         ]
 
         if len(found) == 2:
-            return "Loaded CSV. Trace ID and Company ID columns auto-selected."
+            return "Loaded file. Trace ID and Company ID columns auto-selected."
         if len(found) == 1:
-            return f"Loaded CSV. {found[0]} column auto-selected."
+            return f"Loaded file. {found[0]} column auto-selected."
         if enabled:
-            return "Loaded CSV. Select the Trace ID and/or Company ID columns to continue."
-        return "Loaded CSV. Enable a pipeline to manually choose a column."
+            return "Loaded file. Select the Trace ID and/or Company ID columns to continue."
+        return "Loaded file. Enable a pipeline to manually choose a column."
+
+    def _read_input_file(self, file_path):
+        file_path_lower = file_path.lower()
+
+        if file_path_lower.endswith(".csv"):
+            return pd.read_csv(file_path)
+
+        if file_path_lower.endswith(".tsv"):
+            return pd.read_csv(file_path, sep="\t")
+
+        if file_path_lower.endswith(".xlsx"):
+            return pd.read_excel(file_path)
+
+        raise ValueError("Unsupported file type. Please choose CSV, TSV, or XLSX.")
+
+    def _build_output_frame(self, valid_pipelines):
+        output = {}
+        max_length = 0
+
+        for pipeline_key in valid_pipelines:
+            missing_ids = self.pipeline_state[pipeline_key]["missing"]
+            output[PIPELINES[pipeline_key]["missing_column_name"]] = missing_ids
+            max_length = max(max_length, len(missing_ids))
+
+        for column_name, values in list(output.items()):
+            output[column_name] = values + [""] * (max_length - len(values))
+
+        return pd.DataFrame(output)
+
+    def _write_output_file(self, output_df, save_path):
+        save_path_lower = save_path.lower()
+
+        if save_path_lower.endswith(".csv"):
+            output_df.to_csv(save_path, index=False)
+            return
+
+        if save_path_lower.endswith(".xlsx"):
+            output_df.to_excel(save_path, index=False)
+            return
+
+        raise ValueError("Unsupported export type. Please save as CSV or XLSX.")
 
     def auto_detect_column(self, pipeline_key):
         config = PIPELINES[pipeline_key]
@@ -631,21 +672,21 @@ class MainWindow(QMainWindow):
     def import_csv(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select CSV",
+            "Select Data File",
             "",
-            "CSV Files (*.csv)",
+            "Supported Files (*.csv *.tsv *.xlsx);;CSV Files (*.csv);;TSV Files (*.tsv);;Excel Files (*.xlsx)",
         )
 
         if not file_path:
             return
 
         try:
-            df = pd.read_csv(file_path)
+            df = self._read_input_file(file_path)
         except Exception as exc:
             QMessageBox.warning(
                 self,
                 "Unable to Open File",
-                f"The CSV could not be loaded.\n\n{exc}",
+                f"The selected file could not be loaded.\n\n{exc}",
             )
             return
 
@@ -653,7 +694,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Empty File",
-                "The selected CSV does not contain any rows.",
+                "The selected file does not contain any rows.",
             )
             return
 
@@ -760,35 +801,27 @@ class MainWindow(QMainWindow):
             self,
             "Save Missing IDs",
             "missing_trace_and_company_ids.csv",
-            "CSV Files (*.csv)",
+            "CSV Files (*.csv);;Excel Files (*.xlsx)",
         )
 
         if not save_path:
             return
 
-        output = {}
-        max_length = 0
-        for pipeline_key in valid_pipelines:
-            missing_ids = self.pipeline_state[pipeline_key]["missing"]
-            output[PIPELINES[pipeline_key]["missing_column_name"]] = missing_ids
-            max_length = max(max_length, len(missing_ids))
-
-        for column_name, values in list(output.items()):
-            output[column_name] = values + [""] * (max_length - len(values))
+        output_df = self._build_output_frame(valid_pipelines)
 
         try:
-            pd.DataFrame(output).to_csv(save_path, index=False)
+            self._write_output_file(output_df, save_path)
             exported_titles = ", ".join(PIPELINES[key]["title"] for key in valid_pipelines)
             self._set_status(f"Exported missing IDs for {exported_titles}.")
         except PermissionError:
             QMessageBox.warning(
                 self,
                 "File Locked",
-                "Close the CSV file if it is open in Excel, then try again.",
+                "Close the export file if it is open in another app, then try again.",
             )
         except Exception as exc:
             QMessageBox.warning(
                 self,
                 "Export Failed",
-                f"The CSV could not be saved.\n\n{exc}",
+                f"The export file could not be saved.\n\n{exc}",
             )
