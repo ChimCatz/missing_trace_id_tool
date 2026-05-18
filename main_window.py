@@ -1,7 +1,9 @@
 from pathlib import Path
+from typing import cast, TypedDict
 
 import pandas as pd
 from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -26,7 +28,43 @@ from zoho_integration import (
 )
 
 
-PIPELINES = {
+class PipelineConfig(TypedDict):
+    title: str
+    prefix: str
+    digits: int
+    start_number: int
+    exact_headers: tuple[str, ...]
+    header_keywords: tuple[str, ...]
+    column_placeholder: str
+    expected_placeholder: str
+    missing_column_name: str
+    last_label: str
+    panel_property: str
+    fetch_button_text: str
+    db_source_label: str
+
+
+class PipelineRuntimeState(TypedDict):
+    missing: list[str]
+    enabled: bool
+    valid: bool
+    auto_selected: bool
+    busy: bool
+    dataframes: dict[str, pd.DataFrame | None]
+    active_source: str | None
+
+
+class PipelineWidgetGroup(TypedDict):
+    section: QFrame
+    include_btn: QPushButton
+    state_label: QLabel
+    source_label: QLabel
+    inputs_container: QWidget
+    column_box: QComboBox
+    expected_input: QLineEdit
+
+
+PIPELINES: dict[str, PipelineConfig] = {
     "trace": {
         "title": "Trace ID",
         "prefix": "TMGID",
@@ -60,7 +98,7 @@ PIPELINES = {
 }
 
 
-def normalize_column_name(value):
+def normalize_column_name(value: object) -> str:
     text = str(value).strip().lower()
     return " ".join(text.replace("_", " ").replace("-", " ").split())
 
@@ -70,11 +108,11 @@ class DataFetchWorker(QObject):
     finished = Signal(str, object)
     failed = Signal(str, str)
 
-    def __init__(self, pipeline_key):
+    def __init__(self, pipeline_key: str) -> None:
         super().__init__()
         self.pipeline_key = pipeline_key
 
-    def run(self):
+    def run(self) -> None:
         try:
             callback = lambda message: self.status.emit(self.pipeline_key, message)
             if self.pipeline_key == "trace":
@@ -89,16 +127,16 @@ class DataFetchWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
         self.setWindowTitle("Missing Trace ID and Company ID Tool")
         self.resize(980, 620)
         self.setMinimumSize(900, 520)
 
-        self.shared_df = None
-        self.imported_file_path = None
-        self.pipeline_state = {
+        self.shared_df: pd.DataFrame | None = None
+        self.imported_file_path: str | None = None
+        self.pipeline_state: dict[str, PipelineRuntimeState] = {
             key: {
                 "missing": [],
                 "enabled": False,
@@ -113,10 +151,10 @@ class MainWindow(QMainWindow):
             }
             for key in PIPELINES
         }
-        self.pipeline_widgets = {}
-        self.stats_labels = {}
-        self.fetch_threads = {}
-        self.fetch_workers = {}
+        self.pipeline_widgets: dict[str, PipelineWidgetGroup] = {}
+        self.stats_labels: dict[tuple[str, str], QLabel] = {}
+        self.fetch_threads: dict[str, QThread] = {}
+        self.fetch_workers: dict[str, DataFetchWorker] = {}
 
         self._build_ui()
         self._apply_styles()
@@ -126,11 +164,13 @@ class MainWindow(QMainWindow):
             self._update_source_label(pipeline_key)
         self._refresh_actions()
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.NoFrame)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         container = QWidget()
         main_layout = QVBoxLayout(container)
@@ -170,7 +210,7 @@ class MainWindow(QMainWindow):
 
         local_label = QLabel("From Local Computer")
         local_label.setObjectName("sourceGroupLabel")
-        local_label.setAlignment(Qt.AlignCenter)
+        local_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         local_layout.addWidget(local_label)
 
         self.import_btn = QPushButton("Import Local File")
@@ -188,7 +228,7 @@ class MainWindow(QMainWindow):
 
         online_label = QLabel("Fetch from DB Online")
         online_label.setObjectName("sourceGroupLabel")
-        online_label.setAlignment(Qt.AlignCenter)
+        online_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         online_layout.addWidget(online_label)
 
         fetch_buttons_row = QHBoxLayout()
@@ -289,7 +329,7 @@ class MainWindow(QMainWindow):
         scroll_area.setWidget(container)
         self.setCentralWidget(scroll_area)
 
-    def _build_pipeline_section(self, pipeline_key):
+    def _build_pipeline_section(self, pipeline_key: str) -> QFrame:
         config = PIPELINES[pipeline_key]
 
         section = QFrame()
@@ -330,8 +370,10 @@ class MainWindow(QMainWindow):
 
         column_box = QComboBox()
         column_box.setEditable(True)
-        column_box.lineEdit().setAlignment(Qt.AlignLeft)
-        column_box.lineEdit().setPlaceholderText(config["column_placeholder"])
+        line_edit = column_box.lineEdit()
+        assert line_edit is not None
+        line_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        line_edit.setPlaceholderText(config["column_placeholder"])
         column_box.currentTextChanged.connect(
             lambda _text, key=pipeline_key: self.column_changed(key)
         )
@@ -358,12 +400,12 @@ class MainWindow(QMainWindow):
 
         return section
 
-    def _make_stats_header(self, text):
+    def _make_stats_header(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setObjectName("statsHeaderLabel")
         return label
 
-    def _apply_styles(self):
+    def _apply_styles(self) -> None:
         self.setStyleSheet(
             """
             QMainWindow {
@@ -544,16 +586,16 @@ class MainWindow(QMainWindow):
             """
         )
 
-    def _set_status(self, message):
+    def _set_status(self, message: str) -> None:
         self.status_message = message
         self._update_info_bar()
 
-    def _has_any_loaded_data(self):
+    def _has_any_loaded_data(self) -> bool:
         if self.shared_df is not None:
             return True
         return any(self._pipeline_has_available_data(key) for key in PIPELINES)
 
-    def _build_summary_message(self):
+    def _build_summary_message(self) -> str:
         imported_text = "Local file: none"
         if self.shared_df is not None:
             file_name = (
@@ -583,44 +625,47 @@ class MainWindow(QMainWindow):
 
         return "Loaded | " + " | ".join([imported_text] + pipeline_parts)
 
-    def _update_info_bar(self):
+    def _update_info_bar(self) -> None:
         detail_line = self._build_summary_message()
         self.status.setText(f"{self.status_message}\n{detail_line}")
 
-    def _confirm_replace_data(self, action_label, detail_text):
+    def _confirm_replace_data(self, action_label: str, detail_text: str) -> bool:
         result = QMessageBox.question(
             self,
             "Replace Loaded Data?",
             f"{detail_text}\n\nDo you want to continue with {action_label}?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        return result == QMessageBox.Yes
+        return result == QMessageBox.StandardButton.Yes
 
-    def _confirm_clear_all(self):
+    def _confirm_clear_all(self) -> bool:
         result = QMessageBox.question(
             self,
             "Clear All Files?",
             "Confirm deleting all files from memory? This will remove all imported and fetched datasets from the app until you load them again.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        return result == QMessageBox.Yes
+        return result == QMessageBox.StandardButton.Yes
 
-    def _get_current_dataframe(self, pipeline_key):
+    def _get_current_dataframe(self, pipeline_key: str) -> pd.DataFrame | None:
         source = self.pipeline_state[pipeline_key]["active_source"]
         if not source:
             return None
-        return self.pipeline_state[pipeline_key]["dataframes"].get(source)
+        return cast(
+            pd.DataFrame | None,
+            self.pipeline_state[pipeline_key]["dataframes"].get(source),
+        )
 
-    def _pipeline_has_available_data(self, pipeline_key):
+    def _pipeline_has_available_data(self, pipeline_key: str) -> bool:
         state = self.pipeline_state[pipeline_key]
         return any(
             dataframe is not None and not dataframe.empty
             for dataframe in state["dataframes"].values()
         )
 
-    def _update_source_label(self, pipeline_key):
+    def _update_source_label(self, pipeline_key: str) -> None:
         state = self.pipeline_state[pipeline_key]
         source = state["active_source"]
         widgets = self.pipeline_widgets[pipeline_key]
@@ -643,7 +688,7 @@ class MainWindow(QMainWindow):
 
         widgets["source_label"].setText("Source: No data loaded")
 
-    def _refresh_actions(self):
+    def _refresh_actions(self) -> None:
         has_enabled_pipeline = any(
             self.pipeline_state[key]["enabled"] and self._get_current_dataframe(key) is not None
             for key in PIPELINES
@@ -657,14 +702,14 @@ class MainWindow(QMainWindow):
         self.top_company_fetch_btn.setEnabled(not self.pipeline_state["company"]["busy"])
         self._update_info_bar()
 
-    def _reset_pipeline_stats(self, pipeline_key):
+    def _reset_pipeline_stats(self, pipeline_key: str) -> None:
         self.pipeline_state[pipeline_key]["missing"] = []
         self.pipeline_state[pipeline_key]["valid"] = False
         self.stats_labels[(pipeline_key, "records")].setText("-")
         self.stats_labels[(pipeline_key, "last")].setText("-")
         self.stats_labels[(pipeline_key, "missing")].setText("-")
 
-    def _update_pipeline_controls(self, pipeline_key):
+    def _update_pipeline_controls(self, pipeline_key: str) -> None:
         widgets = self.pipeline_widgets[pipeline_key]
         state = self.pipeline_state[pipeline_key]
         has_data = self._pipeline_has_available_data(pipeline_key)
@@ -680,9 +725,10 @@ class MainWindow(QMainWindow):
         if opacity_effect is None:
             opacity_effect = QGraphicsOpacityEffect(widgets["inputs_container"])
             widgets["inputs_container"].setGraphicsEffect(opacity_effect)
+        opacity_effect = cast(QGraphicsOpacityEffect, opacity_effect)
         opacity_effect.setOpacity(1.0 if state["enabled"] and active_data else 0.35)
 
-    def _set_pipeline_enabled(self, pipeline_key, enabled):
+    def _set_pipeline_enabled(self, pipeline_key: str, enabled: bool) -> None:
         state = self.pipeline_state[pipeline_key]
         widgets = self.pipeline_widgets[pipeline_key]
         if enabled and self._get_current_dataframe(pipeline_key) is None:
@@ -701,7 +747,7 @@ class MainWindow(QMainWindow):
         self._update_pipeline_controls(pipeline_key)
         self._refresh_actions()
 
-    def _set_pipeline_busy(self, pipeline_key, busy):
+    def _set_pipeline_busy(self, pipeline_key: str, busy: bool) -> None:
         self.pipeline_state[pipeline_key]["busy"] = busy
         if busy:
             self.pipeline_widgets[pipeline_key]["state_label"].setText("Fetching from DB...")
@@ -713,7 +759,7 @@ class MainWindow(QMainWindow):
         self._update_pipeline_controls(pipeline_key)
         self._refresh_actions()
 
-    def _populate_column_box(self, pipeline_key):
+    def _populate_column_box(self, pipeline_key: str) -> None:
         dataframe = self._get_current_dataframe(pipeline_key)
         column_box = self.pipeline_widgets[pipeline_key]["column_box"]
         selected_text = column_box.currentText().strip()
@@ -728,7 +774,7 @@ class MainWindow(QMainWindow):
             column_box.setCurrentText("")
         column_box.blockSignals(False)
 
-    def _match_status_message(self):
+    def _match_status_message(self) -> str:
         busy_pipelines = [
             PIPELINES[key]["title"]
             for key in PIPELINES
@@ -759,7 +805,7 @@ class MainWindow(QMainWindow):
 
         return "No data loaded yet."
 
-    def _read_input_file(self, file_path):
+    def _read_input_file(self, file_path: str) -> pd.DataFrame:
         file_path_lower = file_path.lower()
 
         if file_path_lower.endswith(".csv"):
@@ -773,7 +819,7 @@ class MainWindow(QMainWindow):
 
         raise ValueError("Unsupported file type. Please choose CSV, TSV, XLSX, or XLSM.")
 
-    def _build_output_frame(self, valid_pipelines):
+    def _build_output_frame(self, valid_pipelines: list[str]) -> pd.DataFrame:
         output = {}
         max_length = 0
 
@@ -787,7 +833,7 @@ class MainWindow(QMainWindow):
 
         return pd.DataFrame(output)
 
-    def _write_output_file(self, output_df, save_path):
+    def _write_output_file(self, output_df: pd.DataFrame, save_path: str) -> None:
         save_path_lower = save_path.lower()
 
         if save_path_lower.endswith(".csv"):
@@ -800,7 +846,7 @@ class MainWindow(QMainWindow):
 
         raise ValueError("Unsupported export type. Please save as CSV or XLSX.")
 
-    def _resolve_export_path(self, save_path, selected_filter):
+    def _resolve_export_path(self, save_path: str, selected_filter: str) -> str:
         path = Path(save_path)
         if path.suffix:
             return str(path)
@@ -809,7 +855,7 @@ class MainWindow(QMainWindow):
             return f"{save_path}.xlsx"
         return f"{save_path}.csv"
 
-    def auto_detect_column(self, pipeline_key):
+    def auto_detect_column(self, pipeline_key: str) -> str | None:
         config = PIPELINES[pipeline_key]
         dataframe = self._get_current_dataframe(pipeline_key)
         if dataframe is None:
@@ -838,7 +884,7 @@ class MainWindow(QMainWindow):
 
         return None
 
-    def validate_expected(self, pipeline_key):
+    def validate_expected(self, pipeline_key: str) -> bool:
         expected_input = self.pipeline_widgets[pipeline_key]["expected_input"]
         value = expected_input.text().strip()
 
@@ -861,7 +907,7 @@ class MainWindow(QMainWindow):
         expected_input.setStyleSheet("")
         return True
 
-    def validate_selected_column(self, pipeline_key, show_error=False):
+    def validate_selected_column(self, pipeline_key: str, show_error: bool = False) -> bool:
         config = PIPELINES[pipeline_key]
         dataframe = self._get_current_dataframe(pipeline_key)
 
@@ -932,7 +978,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         return True
 
-    def _activate_dataframe(self, pipeline_key, source, auto_enable):
+    def _activate_dataframe(self, pipeline_key: str, source: str, auto_enable: bool) -> bool:
         state = self.pipeline_state[pipeline_key]
         state["active_source"] = source
         state["valid"] = False
@@ -959,7 +1005,7 @@ class MainWindow(QMainWindow):
         self._set_pipeline_enabled(pipeline_key, auto_enable)
         return False
 
-    def toggle_pipeline(self, pipeline_key, checked):
+    def toggle_pipeline(self, pipeline_key: str, checked: bool) -> None:
         if self._get_current_dataframe(pipeline_key) is None:
             self.pipeline_widgets[pipeline_key]["include_btn"].blockSignals(True)
             self.pipeline_widgets[pipeline_key]["include_btn"].setChecked(False)
@@ -973,7 +1019,7 @@ class MainWindow(QMainWindow):
                 self.validate_selected_column(pipeline_key, show_error=False)
         self._set_status(self._match_status_message())
 
-    def column_changed(self, pipeline_key):
+    def column_changed(self, pipeline_key: str) -> None:
         if self._get_current_dataframe(pipeline_key) is None:
             self._refresh_actions()
             return
@@ -989,7 +1035,7 @@ class MainWindow(QMainWindow):
             self._reset_pipeline_stats(pipeline_key)
         self._refresh_actions()
 
-    def expected_changed(self, pipeline_key):
+    def expected_changed(self, pipeline_key: str) -> None:
         if self._get_current_dataframe(pipeline_key) is None:
             return
 
@@ -1010,7 +1056,7 @@ class MainWindow(QMainWindow):
             self.validate_selected_column(pipeline_key, show_error=False)
             self._set_status(self._match_status_message())
 
-    def import_csv(self):
+    def import_csv(self) -> None:
         if self._has_any_loaded_data():
             if not self._confirm_replace_data(
                 "Import File",
@@ -1075,7 +1121,7 @@ class MainWindow(QMainWindow):
                 "was auto-detected. Please review the column selectors manually.",
             )
 
-    def fetch_pipeline_from_db(self, pipeline_key):
+    def fetch_pipeline_from_db(self, pipeline_key: str) -> None:
         if self.pipeline_state[pipeline_key]["busy"]:
             return
 
@@ -1108,10 +1154,17 @@ class MainWindow(QMainWindow):
         self._set_status(f"Preparing {PIPELINES[pipeline_key]['title']} fetch from Zoho DB...")
         thread.start()
 
-    def _handle_fetch_status(self, pipeline_key, message):
+    def _handle_fetch_status(self, pipeline_key: str, message: str) -> None:
         self._set_status(f"{PIPELINES[pipeline_key]['title']}: {message}")
 
-    def _handle_fetch_complete(self, pipeline_key, dataframe):
+    def _handle_fetch_complete(self, pipeline_key: str, dataframe: object) -> None:
+        if not isinstance(dataframe, pd.DataFrame):
+            self._handle_fetch_failed(
+                pipeline_key,
+                "Unexpected data was returned from the background fetch.",
+            )
+            return
+
         self._set_pipeline_busy(pipeline_key, False)
 
         if dataframe is None or dataframe.empty:
@@ -1135,7 +1188,7 @@ class MainWindow(QMainWindow):
             )
         self._refresh_actions()
 
-    def _handle_fetch_failed(self, pipeline_key, message):
+    def _handle_fetch_failed(self, pipeline_key: str, message: str) -> None:
         self._set_pipeline_busy(pipeline_key, False)
         QMessageBox.warning(
             self,
@@ -1146,12 +1199,12 @@ class MainWindow(QMainWindow):
             f"{PIPELINES[pipeline_key]['title']} DB fetch failed."
         )
 
-    def _cleanup_fetch_thread(self, pipeline_key):
+    def _cleanup_fetch_thread(self, pipeline_key: str) -> None:
         self.fetch_threads.pop(pipeline_key, None)
         self.fetch_workers.pop(pipeline_key, None)
         self._refresh_actions()
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: QCloseEvent) -> None:
         busy_pipelines = [
             PIPELINES[key]["title"]
             for key in PIPELINES
@@ -1170,7 +1223,7 @@ class MainWindow(QMainWindow):
 
         super().closeEvent(event)
 
-    def clear_all_data(self):
+    def clear_all_data(self) -> None:
         if not self._has_any_loaded_data():
             return
 
@@ -1204,7 +1257,7 @@ class MainWindow(QMainWindow):
         self._set_status("All files were cleared from memory.")
         self._refresh_actions()
 
-    def _validate_active_pipelines(self):
+    def _validate_active_pipelines(self) -> list[str] | None:
         enabled_pipelines = [
             key for key in PIPELINES if self.pipeline_state[key]["enabled"]
         ]
@@ -1275,7 +1328,7 @@ class MainWindow(QMainWindow):
         )
         return None
 
-    def export_missing(self):
+    def export_missing(self) -> None:
         if not any(self._get_current_dataframe(key) is not None for key in PIPELINES):
             QMessageBox.warning(
                 self,
