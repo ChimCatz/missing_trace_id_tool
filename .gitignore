@@ -20,6 +20,8 @@ dist/
 
 .idea/
 .vscode/
+.env
+.zoho_cache.json
 
 data/*.csv
 data/*.xlsx

@@ -1,4 +1,7 @@
-from PySide6.QtCore import Qt
+from pathlib import Path
+
+import pandas as pd
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -16,9 +19,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import pandas as pd
-
 from trace_logic import analyze_identifier_series, find_missing_ids, has_identifier_values
+from zoho_integration import (
+    fetch_company_id_lookup_dataframe,
+    fetch_trace_id_lookup_dataframe,
+)
 
 
 PIPELINES = {
@@ -27,28 +32,60 @@ PIPELINES = {
         "prefix": "TMGID",
         "digits": 6,
         "start_number": 1,
-        "exact_headers": ("trace id",),
-        "header_keywords": ("trace",),
+        "exact_headers": ("trace id", "traceid"),
+        "header_keywords": (),
         "column_placeholder": "Select or type the Trace ID column",
         "expected_placeholder": "Expected total Trace ID count (optional)",
         "missing_column_name": "Missing Trace IDs",
         "last_label": "Last Trace ID",
         "panel_property": "trace",
+        "fetch_button_text": "Fetch Trace IDs from DB",
+        "db_source_label": "Zoho Leads",
     },
     "company": {
         "title": "Company ID",
         "prefix": "ACC",
         "digits": 6,
         "start_number": 0,
-        "exact_headers": ("company id", "cid"),
-        "header_keywords": ("company", "cid"),
+        "exact_headers": ("company id", "companyid", "company id1", "companyid1", "cid"),
+        "header_keywords": ("cid",),
         "column_placeholder": "Select or type the Company ID column",
         "expected_placeholder": "Expected total Company ID count (optional)",
         "missing_column_name": "Missing Company IDs",
         "last_label": "Last Company ID",
         "panel_property": "company",
+        "fetch_button_text": "Fetch Company IDs from DB",
+        "db_source_label": "Zoho Company Registry",
     },
 }
+
+
+def normalize_column_name(value):
+    text = str(value).strip().lower()
+    return " ".join(text.replace("_", " ").replace("-", " ").split())
+
+
+class DataFetchWorker(QObject):
+    status = Signal(str, str)
+    finished = Signal(str, object)
+    failed = Signal(str, str)
+
+    def __init__(self, pipeline_key):
+        super().__init__()
+        self.pipeline_key = pipeline_key
+
+    def run(self):
+        try:
+            callback = lambda message: self.status.emit(self.pipeline_key, message)
+            if self.pipeline_key == "trace":
+                dataframe = fetch_trace_id_lookup_dataframe(status_callback=callback)
+            else:
+                dataframe = fetch_company_id_lookup_dataframe(status_callback=callback)
+        except Exception as exc:
+            self.failed.emit(self.pipeline_key, str(exc))
+            return
+
+        self.finished.emit(self.pipeline_key, dataframe)
 
 
 class MainWindow(QMainWindow):
@@ -56,26 +93,37 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Missing Trace ID and Company ID Tool")
-        self.resize(940, 620)
-        self.setMinimumSize(860, 560)
+        self.resize(980, 620)
+        self.setMinimumSize(900, 520)
 
-        self.df = None
+        self.shared_df = None
+        self.imported_file_path = None
         self.pipeline_state = {
             key: {
                 "missing": [],
                 "enabled": False,
                 "valid": False,
                 "auto_selected": False,
+                "busy": False,
+                "dataframes": {
+                    "import": None,
+                    "db": None,
+                },
+                "active_source": None,
             }
             for key in PIPELINES
         }
         self.pipeline_widgets = {}
         self.stats_labels = {}
+        self.fetch_threads = {}
+        self.fetch_workers = {}
 
         self._build_ui()
         self._apply_styles()
+        self.status_message = "No data loaded yet."
         for pipeline_key in PIPELINES:
             self._set_pipeline_enabled(pipeline_key, False)
+            self._update_source_label(pipeline_key)
         self._refresh_actions()
 
     def _build_ui(self):
@@ -86,22 +134,21 @@ class MainWindow(QMainWindow):
 
         container = QWidget()
         main_layout = QVBoxLayout(container)
-        main_layout.setContentsMargins(20, 18, 20, 18)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(16, 12, 16, 12)
+        main_layout.setSpacing(8)
 
         title = QLabel("Missing Trace ID and Company ID Tool")
         title.setObjectName("titleLabel")
         main_layout.addWidget(title)
 
         subtitle = QLabel(
-            "Import a CSV, TSV, or Excel file, select the Trace ID and/or "
-            "Company ID column, and export missing IDs."
+            "Load IDs from a local file or fetch them from Zoho CRM."
         )
         subtitle.setObjectName("subtitleLabel")
         subtitle.setWordWrap(True)
         main_layout.addWidget(subtitle)
 
-        self.status = QLabel("Import a CSV, TSV, or Excel file to begin.")
+        self.status = QLabel("No data loaded yet.")
         self.status.setObjectName("statusLabel")
         self.status.setWordWrap(True)
         main_layout.addWidget(self.status)
@@ -109,27 +156,78 @@ class MainWindow(QMainWindow):
         file_panel = QFrame()
         file_panel.setObjectName("panel")
         file_layout = QVBoxLayout(file_panel)
-        file_layout.setContentsMargins(14, 14, 14, 14)
-        file_layout.setSpacing(12)
+        file_layout.setContentsMargins(12, 10, 12, 10)
+        file_layout.setSpacing(8)
 
-        import_row = QHBoxLayout()
-        import_row.setSpacing(10)
+        sources_row = QHBoxLayout()
+        sources_row.setSpacing(8)
 
-        self.import_btn = QPushButton("Import File")
+        local_panel = QFrame()
+        local_panel.setObjectName("sourceGroupPanel")
+        local_layout = QVBoxLayout(local_panel)
+        local_layout.setContentsMargins(8, 8, 8, 8)
+        local_layout.setSpacing(6)
+
+        local_label = QLabel("From Local Computer")
+        local_label.setObjectName("sourceGroupLabel")
+        local_label.setAlignment(Qt.AlignCenter)
+        local_layout.addWidget(local_label)
+
+        self.import_btn = QPushButton("Import Local File")
         self.import_btn.setObjectName("importButton")
         self.import_btn.clicked.connect(self.import_csv)
-        import_row.addWidget(self.import_btn, 0)
+        local_layout.addWidget(self.import_btn)
 
-        self.file_label = QLabel("No file selected")
-        self.file_label.setObjectName("fileLabel")
-        self.file_label.setWordWrap(True)
-        import_row.addWidget(self.file_label, 1)
+        sources_row.addWidget(local_panel, 1)
 
-        file_layout.addLayout(import_row)
+        online_panel = QFrame()
+        online_panel.setObjectName("sourceGroupPanel")
+        online_layout = QVBoxLayout(online_panel)
+        online_layout.setContentsMargins(8, 8, 8, 8)
+        online_layout.setSpacing(6)
+
+        online_label = QLabel("Fetch from DB Online")
+        online_label.setObjectName("sourceGroupLabel")
+        online_label.setAlignment(Qt.AlignCenter)
+        online_layout.addWidget(online_label)
+
+        fetch_buttons_row = QHBoxLayout()
+        fetch_buttons_row.setSpacing(8)
+
+        trace_fetch_btn = QPushButton(PIPELINES["trace"]["fetch_button_text"])
+        trace_fetch_btn.setObjectName("topFetchTraceButton")
+        trace_fetch_btn.clicked.connect(
+            lambda _checked=False: self.fetch_pipeline_from_db("trace")
+        )
+        self.top_trace_fetch_btn = trace_fetch_btn
+        fetch_buttons_row.addWidget(trace_fetch_btn, 1)
+
+        company_fetch_btn = QPushButton(PIPELINES["company"]["fetch_button_text"])
+        company_fetch_btn.setObjectName("topFetchCompanyButton")
+        company_fetch_btn.clicked.connect(
+            lambda _checked=False: self.fetch_pipeline_from_db("company")
+        )
+        self.top_company_fetch_btn = company_fetch_btn
+        fetch_buttons_row.addWidget(company_fetch_btn, 1)
+
+        online_layout.addLayout(fetch_buttons_row)
+        sources_row.addWidget(online_panel, 2)
+
+        file_layout.addLayout(sources_row)
+
+        self.clear_btn = QPushButton("Clear All Files")
+        self.clear_btn.setObjectName("clearButton")
+        self.clear_btn.clicked.connect(self.clear_all_data)
+        self.clear_btn.setMaximumWidth(140)
+
+        clear_row = QHBoxLayout()
+        clear_row.addStretch(1)
+        clear_row.addWidget(self.clear_btn, 0)
+        file_layout.addLayout(clear_row)
 
         pipeline_grid = QGridLayout()
-        pipeline_grid.setHorizontalSpacing(14)
-        pipeline_grid.setVerticalSpacing(10)
+        pipeline_grid.setHorizontalSpacing(12)
+        pipeline_grid.setVerticalSpacing(6)
 
         trace_header = QLabel("Trace ID Pipeline")
         trace_header.setObjectName("sectionLabel")
@@ -144,22 +242,14 @@ class MainWindow(QMainWindow):
 
         file_layout.addLayout(pipeline_grid)
 
-        helper = QLabel(
-            "Only enter expected totals when you know the exact upper bound for "
-            "that ID series."
-        )
-        helper.setObjectName("helperLabel")
-        helper.setWordWrap(True)
-        file_layout.addWidget(helper)
-
         main_layout.addWidget(file_panel)
 
         stats_panel = QFrame()
         stats_panel.setObjectName("panel")
         stats_layout = QGridLayout(stats_panel)
-        stats_layout.setContentsMargins(14, 14, 14, 14)
-        stats_layout.setHorizontalSpacing(18)
-        stats_layout.setVerticalSpacing(8)
+        stats_layout.setContentsMargins(12, 10, 12, 10)
+        stats_layout.setHorizontalSpacing(16)
+        stats_layout.setVerticalSpacing(4)
 
         stats_layout.addWidget(self._make_stats_header(""), 0, 0)
         stats_layout.addWidget(self._make_stats_header("Trace ID"), 0, 1)
@@ -206,14 +296,15 @@ class MainWindow(QMainWindow):
         section.setObjectName("subPanel")
         section.setProperty("pipelineType", config["panel_property"])
         layout = QVBoxLayout(section)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
 
         top_row = QHBoxLayout()
-        top_row.setSpacing(8)
+        top_row.setSpacing(6)
 
         include_btn = QPushButton("Include")
         include_btn.setObjectName("includeButton")
+        include_btn.setProperty("pipelineType", config["panel_property"])
         include_btn.setCheckable(True)
         include_btn.clicked.connect(
             lambda checked, key=pipeline_key: self.toggle_pipeline(key, checked)
@@ -227,10 +318,15 @@ class MainWindow(QMainWindow):
         top_row.addStretch(1)
         layout.addLayout(top_row)
 
+        source_label = QLabel("Source: No data loaded")
+        source_label.setObjectName("sourceLabel")
+        source_label.setWordWrap(True)
+        layout.addWidget(source_label)
+
         inputs_container = QWidget()
         inputs_layout = QVBoxLayout(inputs_container)
         inputs_layout.setContentsMargins(0, 0, 0, 0)
-        inputs_layout.setSpacing(8)
+        inputs_layout.setSpacing(6)
 
         column_box = QComboBox()
         column_box.setEditable(True)
@@ -254,6 +350,7 @@ class MainWindow(QMainWindow):
             "section": section,
             "include_btn": include_btn,
             "state_label": state_label,
+            "source_label": source_label,
             "inputs_container": inputs_container,
             "column_box": column_box,
             "expected_input": expected_input,
@@ -282,20 +379,31 @@ class MainWindow(QMainWindow):
                 font-size: 13px;
             }
             QLabel#titleLabel {
-                font-size: 24px;
+                font-size: 22px;
                 font-weight: 700;
                 color: #1d3557;
             }
             QLabel#subtitleLabel {
                 color: #4f6478;
-                font-size: 13px;
+                font-size: 12px;
+            }
+            QFrame#sourceGroupPanel {
+                background-color: #fbfcfe;
+                border: 1px solid #d7e1ec;
+                border-radius: 10px;
+            }
+            QLabel#sourceGroupLabel {
+                color: #30485f;
+                font-size: 12px;
+                font-weight: 700;
             }
             QLabel#statusLabel {
-                background-color: #e7f0fb;
-                border: 1px solid #c8dbf1;
+                background-color: #f4f7fb;
+                border: 1px solid #d5dfeb;
                 border-radius: 8px;
-                padding: 8px 10px;
-                color: #27496d;
+                padding: 7px 9px;
+                color: #1f3b57;
+                font-weight: 600;
             }
             QFrame#panel {
                 background-color: #ffffff;
@@ -303,25 +411,18 @@ class MainWindow(QMainWindow):
                 border-radius: 10px;
             }
             QFrame#subPanel[pipelineType="trace"] {
-                background-color: #eef6ff;
-                border: 1px solid #cfe0f5;
+                background-color: #edf5ff;
+                border: 1px solid #c8dcf5;
                 border-radius: 10px;
             }
             QFrame#subPanel[pipelineType="company"] {
-                background-color: #eefaf2;
-                border: 1px solid #cfe8d6;
+                background-color: #eef9f1;
+                border: 1px solid #c7e6d0;
                 border-radius: 10px;
-            }
-            QLabel#fileLabel {
-                color: #55697d;
-            }
-            QLabel#helperLabel {
-                color: #6a7f94;
-                font-size: 12px;
             }
             QLabel#sectionLabel {
                 color: #1d3557;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 700;
             }
             QLabel#pipelineStateLabel {
@@ -329,27 +430,31 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 font-weight: 600;
             }
+            QLabel#sourceLabel {
+                color: #46637e;
+                font-size: 12px;
+            }
             QLabel#statsHeaderLabel {
                 color: #1d3557;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 700;
-                padding-bottom: 4px;
+                padding-bottom: 2px;
             }
             QLabel#statsTitleLabel {
                 color: #4f6478;
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 600;
             }
             QLabel#statsValueLabel {
                 color: #213547;
-                font-size: 14px;
+                font-size: 13px;
             }
             QLineEdit, QComboBox {
                 background-color: #ffffff;
                 border: 1px solid #c9d5e2;
                 border-radius: 8px;
-                padding: 8px 10px;
-                min-height: 20px;
+                padding: 6px 9px;
+                min-height: 18px;
             }
             QComboBox QAbstractItemView {
                 min-height: 120px;
@@ -360,16 +465,46 @@ class MainWindow(QMainWindow):
             QPushButton {
                 border: none;
                 border-radius: 8px;
-                padding: 8px 14px;
+                padding: 6px 12px;
                 font-weight: 600;
-                min-height: 20px;
+                min-height: 18px;
             }
             QPushButton#importButton {
-                background-color: #4c8bf5;
-                color: white;
+                background-color: #e9eef5;
+                color: #2f475d;
+                border: 1px solid #cfd8e2;
             }
             QPushButton#importButton:hover {
-                background-color: #3d7ce7;
+                background-color: #dde5ee;
+            }
+            QPushButton#topFetchTraceButton {
+                background-color: #d9e9ff;
+                color: #174a95;
+                border: 1px solid #b9d2f8;
+            }
+            QPushButton#topFetchTraceButton:hover {
+                background-color: #cbe0ff;
+            }
+            QPushButton#topFetchCompanyButton {
+                background-color: #dbf2e2;
+                color: #1d6b3b;
+                border: 1px solid #bee0c8;
+            }
+            QPushButton#topFetchCompanyButton:hover {
+                background-color: #cdebd7;
+            }
+            QPushButton#clearButton {
+                background-color: #fdeaea;
+                color: #8b2e2e;
+                border: 1px solid #f1bfc0;
+            }
+            QPushButton#clearButton:hover {
+                background-color: #fbdcdc;
+            }
+            QPushButton#clearButton:disabled {
+                background-color: #f5eeee;
+                color: #c09a9a;
+                border: 1px solid #ead8d8;
             }
             QPushButton#exportButton {
                 background-color: #35a86b;
@@ -378,32 +513,149 @@ class MainWindow(QMainWindow):
             QPushButton#exportButton:hover {
                 background-color: #2e975f;
             }
-            QPushButton#includeButton {
-                background-color: #d4dee8;
-                color: #284058;
-                min-width: 74px;
-                padding: 6px 10px;
+            QPushButton#includeButton[pipelineType="trace"] {
+                background-color: #d8e7fb;
+                color: #23496f;
+                min-width: 72px;
+                padding: 4px 9px;
             }
-            QPushButton#includeButton:checked {
-                background-color: #4c8bf5;
+            QPushButton#includeButton[pipelineType="trace"]:checked {
+                background-color: #2f6fdd;
+                color: white;
+            }
+            QPushButton#includeButton[pipelineType="company"] {
+                background-color: #dcefe2;
+                color: #28563a;
+                min-width: 72px;
+                padding: 4px 9px;
+            }
+            QPushButton#includeButton[pipelineType="company"]:checked {
+                background-color: #2f9d57;
                 color: white;
             }
             QPushButton:disabled {
-                background-color: #c7d2df;
-                color: #6f7f91;
+                background-color: #d8e0e8;
+                color: #7a8795;
+            }
+            QPushButton#exportButton:disabled {
+                background-color: #dce4dd;
+                color: #7c8b7e;
             }
             """
         )
 
     def _set_status(self, message):
-        self.status.setText(message)
+        self.status_message = message
+        self._update_info_bar()
+
+    def _has_any_loaded_data(self):
+        if self.shared_df is not None:
+            return True
+        return any(self._pipeline_has_available_data(key) for key in PIPELINES)
+
+    def _build_summary_message(self):
+        imported_text = "Local file: none"
+        if self.shared_df is not None:
+            file_name = (
+                Path(self.imported_file_path).name
+                if self.imported_file_path
+                else "Loaded import"
+            )
+            imported_text = (
+                f"Local file: {file_name} ({len(self.shared_df):,} rows)"
+            )
+
+        pipeline_parts = []
+        for pipeline_key, config in PIPELINES.items():
+            dataframe = self._get_current_dataframe(pipeline_key)
+            if dataframe is None:
+                pipeline_parts.append(f"{config['title']}: none")
+                continue
+
+            source_text = (
+                "DB"
+                if self.pipeline_state[pipeline_key]["active_source"] == "db"
+                else "Local"
+            )
+            pipeline_parts.append(
+                f"{config['title']}: {source_text} ({len(dataframe):,})"
+            )
+
+        return "Loaded | " + " | ".join([imported_text] + pipeline_parts)
+
+    def _update_info_bar(self):
+        detail_line = self._build_summary_message()
+        self.status.setText(f"{self.status_message}\n{detail_line}")
+
+    def _confirm_replace_data(self, action_label, detail_text):
+        result = QMessageBox.question(
+            self,
+            "Replace Loaded Data?",
+            f"{detail_text}\n\nDo you want to continue with {action_label}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return result == QMessageBox.Yes
+
+    def _confirm_clear_all(self):
+        result = QMessageBox.question(
+            self,
+            "Clear All Files?",
+            "Confirm deleting all files from memory? This will remove all imported and fetched datasets from the app until you load them again.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return result == QMessageBox.Yes
+
+    def _get_current_dataframe(self, pipeline_key):
+        source = self.pipeline_state[pipeline_key]["active_source"]
+        if not source:
+            return None
+        return self.pipeline_state[pipeline_key]["dataframes"].get(source)
+
+    def _pipeline_has_available_data(self, pipeline_key):
+        state = self.pipeline_state[pipeline_key]
+        return any(
+            dataframe is not None and not dataframe.empty
+            for dataframe in state["dataframes"].values()
+        )
+
+    def _update_source_label(self, pipeline_key):
+        state = self.pipeline_state[pipeline_key]
+        source = state["active_source"]
+        widgets = self.pipeline_widgets[pipeline_key]
+        dataframe = self._get_current_dataframe(pipeline_key)
+
+        if source == "import" and dataframe is not None:
+            file_name = (
+                Path(self.imported_file_path).name if self.imported_file_path else "Imported file"
+            )
+            widgets["source_label"].setText(
+                f"Source: Local file ({file_name}, {len(dataframe):,} rows)"
+            )
+            return
+
+        if source == "db" and dataframe is not None:
+            widgets["source_label"].setText(
+                f"Source: {PIPELINES[pipeline_key]['db_source_label']} ({len(dataframe):,} rows)"
+            )
+            return
+
+        widgets["source_label"].setText("Source: No data loaded")
 
     def _refresh_actions(self):
-        has_data = self.df is not None and not self.df.empty
         has_enabled_pipeline = any(
-            self.pipeline_state[key]["enabled"] for key in PIPELINES
+            self.pipeline_state[key]["enabled"] and self._get_current_dataframe(key) is not None
+            for key in PIPELINES
         )
-        self.export_btn.setEnabled(has_data and has_enabled_pipeline)
+        has_any_data = any(self._get_current_dataframe(key) is not None for key in PIPELINES)
+        has_busy_pipeline = any(self.pipeline_state[key]["busy"] for key in PIPELINES)
+        self.export_btn.setEnabled(has_enabled_pipeline and not has_busy_pipeline)
+        self.import_btn.setEnabled(not has_busy_pipeline)
+        self.clear_btn.setEnabled(has_any_data and not has_busy_pipeline)
+        self.top_trace_fetch_btn.setEnabled(not self.pipeline_state["trace"]["busy"])
+        self.top_company_fetch_btn.setEnabled(not self.pipeline_state["company"]["busy"])
+        self._update_info_bar()
 
     def _reset_pipeline_stats(self, pipeline_key):
         self.pipeline_state[pipeline_key]["missing"] = []
@@ -412,55 +664,100 @@ class MainWindow(QMainWindow):
         self.stats_labels[(pipeline_key, "last")].setText("-")
         self.stats_labels[(pipeline_key, "missing")].setText("-")
 
-    def _set_pipeline_enabled(self, pipeline_key, enabled):
+    def _update_pipeline_controls(self, pipeline_key):
         widgets = self.pipeline_widgets[pipeline_key]
-        self.pipeline_state[pipeline_key]["enabled"] = enabled
-        widgets["include_btn"].blockSignals(True)
-        widgets["include_btn"].setChecked(enabled)
-        widgets["include_btn"].blockSignals(False)
-        widgets["include_btn"].setText("Included" if enabled else "Include")
-        widgets["state_label"].setText("Included" if enabled else "Not included")
-        widgets["column_box"].setEnabled(enabled)
-        widgets["expected_input"].setEnabled(enabled)
+        state = self.pipeline_state[pipeline_key]
+        has_data = self._pipeline_has_available_data(pipeline_key)
+        active_data = self._get_current_dataframe(pipeline_key) is not None
+
+        widgets["include_btn"].setEnabled(has_data and not state["busy"])
+        widgets["column_box"].setEnabled(state["enabled"] and active_data and not state["busy"])
+        widgets["expected_input"].setEnabled(
+            state["enabled"] and active_data and not state["busy"]
+        )
 
         opacity_effect = widgets["inputs_container"].graphicsEffect()
         if opacity_effect is None:
             opacity_effect = QGraphicsOpacityEffect(widgets["inputs_container"])
             widgets["inputs_container"].setGraphicsEffect(opacity_effect)
-        opacity_effect.setOpacity(1.0 if enabled else 0.35)
+        opacity_effect.setOpacity(1.0 if state["enabled"] and active_data else 0.35)
+
+    def _set_pipeline_enabled(self, pipeline_key, enabled):
+        state = self.pipeline_state[pipeline_key]
+        widgets = self.pipeline_widgets[pipeline_key]
+        if enabled and self._get_current_dataframe(pipeline_key) is None:
+            enabled = False
+
+        state["enabled"] = enabled
+        widgets["include_btn"].blockSignals(True)
+        widgets["include_btn"].setChecked(enabled)
+        widgets["include_btn"].blockSignals(False)
+        widgets["include_btn"].setText("Included" if enabled else "Include")
+        widgets["state_label"].setText("Included" if enabled else "Not included")
 
         if not enabled:
             self._reset_pipeline_stats(pipeline_key)
+
+        self._update_pipeline_controls(pipeline_key)
         self._refresh_actions()
 
-    def _populate_column_boxes(self):
-        column_names = [str(column) for column in self.df.columns]
-        for pipeline_key in PIPELINES:
-            column_box = self.pipeline_widgets[pipeline_key]["column_box"]
-            column_box.blockSignals(True)
-            column_box.clear()
-            column_box.addItems(column_names)
-            column_box.blockSignals(False)
+    def _set_pipeline_busy(self, pipeline_key, busy):
+        self.pipeline_state[pipeline_key]["busy"] = busy
+        if busy:
+            self.pipeline_widgets[pipeline_key]["state_label"].setText("Fetching from DB...")
+        else:
+            enabled = self.pipeline_state[pipeline_key]["enabled"]
+            self.pipeline_widgets[pipeline_key]["state_label"].setText(
+                "Included" if enabled else "Not included"
+            )
+        self._update_pipeline_controls(pipeline_key)
+        self._refresh_actions()
+
+    def _populate_column_box(self, pipeline_key):
+        dataframe = self._get_current_dataframe(pipeline_key)
+        column_box = self.pipeline_widgets[pipeline_key]["column_box"]
+        selected_text = column_box.currentText().strip()
+        column_names = [str(column) for column in dataframe.columns] if dataframe is not None else []
+
+        column_box.blockSignals(True)
+        column_box.clear()
+        column_box.addItems(column_names)
+        if selected_text and selected_text in column_names:
+            column_box.setCurrentText(selected_text)
+        else:
+            column_box.setCurrentText("")
+        column_box.blockSignals(False)
 
     def _match_status_message(self):
-        found = [
+        busy_pipelines = [
             PIPELINES[key]["title"]
             for key in PIPELINES
-            if self.pipeline_state[key]["auto_selected"]
+            if self.pipeline_state[key]["busy"]
         ]
-        enabled = [
-            PIPELINES[key]["title"]
-            for key in PIPELINES
-            if self.pipeline_state[key]["enabled"]
-        ]
+        if busy_pipelines:
+            return "Fetching " + ", ".join(busy_pipelines) + " from Zoho DB..."
 
-        if len(found) == 2:
-            return "Loaded file. Trace ID and Company ID columns auto-selected."
-        if len(found) == 1:
-            return f"Loaded file. {found[0]} column auto-selected."
-        if enabled:
-            return "Loaded file. Select the Trace ID and/or Company ID columns to continue."
-        return "Loaded file. Enable a pipeline to manually choose a column."
+        ready = []
+        for pipeline_key, config in PIPELINES.items():
+            state = self.pipeline_state[pipeline_key]
+            if not state["enabled"] or not state["valid"]:
+                continue
+            source_text = "DB" if state["active_source"] == "db" else "Local"
+            missing_count = len(state["missing"])
+            ready.append(
+                f"{config['title']}: {missing_count:,} missing ({source_text})"
+            )
+
+        if ready:
+            return "Ready | " + " | ".join(ready)
+
+        if self.shared_df is not None:
+            return "Local file loaded. Review the pipeline columns."
+
+        if any(self._pipeline_has_available_data(key) for key in PIPELINES):
+            return "DB data loaded. Review the pipeline columns."
+
+        return "No data loaded yet."
 
     def _read_input_file(self, file_path):
         file_path_lower = file_path.lower()
@@ -471,10 +768,10 @@ class MainWindow(QMainWindow):
         if file_path_lower.endswith(".tsv"):
             return pd.read_csv(file_path, sep="\t")
 
-        if file_path_lower.endswith(".xlsx"):
+        if file_path_lower.endswith((".xlsx", ".xlsm")):
             return pd.read_excel(file_path)
 
-        raise ValueError("Unsupported file type. Please choose CSV, TSV, or XLSX.")
+        raise ValueError("Unsupported file type. Please choose CSV, TSV, XLSX, or XLSM.")
 
     def _build_output_frame(self, valid_pipelines):
         output = {}
@@ -503,9 +800,25 @@ class MainWindow(QMainWindow):
 
         raise ValueError("Unsupported export type. Please save as CSV or XLSX.")
 
+    def _resolve_export_path(self, save_path, selected_filter):
+        path = Path(save_path)
+        if path.suffix:
+            return str(path)
+
+        if "xlsx" in selected_filter.lower():
+            return f"{save_path}.xlsx"
+        return f"{save_path}.csv"
+
     def auto_detect_column(self, pipeline_key):
         config = PIPELINES[pipeline_key]
-        normalized_columns = [(str(column), str(column).strip().lower()) for column in self.df.columns]
+        dataframe = self._get_current_dataframe(pipeline_key)
+        if dataframe is None:
+            return None
+
+        normalized_columns = [
+            (str(column), normalize_column_name(column))
+            for column in dataframe.columns
+        ]
 
         for original, normalized in normalized_columns:
             if normalized in config["exact_headers"]:
@@ -515,9 +828,9 @@ class MainWindow(QMainWindow):
             if any(keyword in normalized for keyword in config["header_keywords"]):
                 return original
 
-        for column in self.df.columns:
+        for column in dataframe.columns:
             if has_identifier_values(
-                self.df[column],
+                dataframe[column],
                 config["prefix"],
                 config["digits"],
             ):
@@ -550,6 +863,7 @@ class MainWindow(QMainWindow):
 
     def validate_selected_column(self, pipeline_key, show_error=False):
         config = PIPELINES[pipeline_key]
+        dataframe = self._get_current_dataframe(pipeline_key)
 
         if not self.pipeline_state[pipeline_key]["enabled"]:
             self._reset_pipeline_stats(pipeline_key)
@@ -558,24 +872,24 @@ class MainWindow(QMainWindow):
 
         column = self.pipeline_widgets[pipeline_key]["column_box"].currentText().strip()
 
-        if self.df is None or column == "":
+        if dataframe is None or column == "":
             self._reset_pipeline_stats(pipeline_key)
             self._refresh_actions()
             return False
 
-        if column not in self.df.columns:
+        if column not in dataframe.columns:
             self._reset_pipeline_stats(pipeline_key)
             if show_error:
                 QMessageBox.warning(
                     self,
                     "Invalid Column",
-                    f"Selected column for {config['title']} was not found in the CSV.",
+                    f"Selected column for {config['title']} was not found in the active data source.",
                 )
             self._refresh_actions()
             return False
 
         analysis = analyze_identifier_series(
-            self.df[column],
+            dataframe[column],
             config["prefix"],
             config["digits"],
         )
@@ -608,7 +922,7 @@ class MainWindow(QMainWindow):
         )
         self.pipeline_state[pipeline_key]["valid"] = True
 
-        self.stats_labels[(pipeline_key, "records")].setText(f"{len(self.df):,}")
+        self.stats_labels[(pipeline_key, "records")].setText(f"{len(dataframe):,}")
         self.stats_labels[(pipeline_key, "last")].setText(
             f"{config['prefix']}{last_id:0{config['digits']}d}"
         )
@@ -618,8 +932,35 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         return True
 
+    def _activate_dataframe(self, pipeline_key, source, auto_enable):
+        state = self.pipeline_state[pipeline_key]
+        state["active_source"] = source
+        state["valid"] = False
+        state["auto_selected"] = False
+        self._reset_pipeline_stats(pipeline_key)
+        self._populate_column_box(pipeline_key)
+        self._update_source_label(pipeline_key)
+
+        auto_col = self.auto_detect_column(pipeline_key)
+        column_box = self.pipeline_widgets[pipeline_key]["column_box"]
+
+        if auto_col:
+            state["auto_selected"] = True
+            self._set_pipeline_enabled(pipeline_key, True)
+            index = column_box.findText(auto_col)
+            if index >= 0:
+                column_box.setCurrentIndex(index)
+            else:
+                column_box.setCurrentText(auto_col)
+            self.validate_selected_column(pipeline_key, show_error=False)
+            return True
+
+        column_box.setCurrentText("")
+        self._set_pipeline_enabled(pipeline_key, auto_enable)
+        return False
+
     def toggle_pipeline(self, pipeline_key, checked):
-        if self.df is None:
+        if self._get_current_dataframe(pipeline_key) is None:
             self.pipeline_widgets[pipeline_key]["include_btn"].blockSignals(True)
             self.pipeline_widgets[pipeline_key]["include_btn"].setChecked(False)
             self.pipeline_widgets[pipeline_key]["include_btn"].blockSignals(False)
@@ -633,7 +974,7 @@ class MainWindow(QMainWindow):
         self._set_status(self._match_status_message())
 
     def column_changed(self, pipeline_key):
-        if self.df is None:
+        if self._get_current_dataframe(pipeline_key) is None:
             self._refresh_actions()
             return
 
@@ -649,7 +990,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def expected_changed(self, pipeline_key):
-        if self.df is None:
+        if self._get_current_dataframe(pipeline_key) is None:
             return
 
         if not self.pipeline_state[pipeline_key]["enabled"]:
@@ -670,11 +1011,19 @@ class MainWindow(QMainWindow):
             self._set_status(self._match_status_message())
 
     def import_csv(self):
+        if self._has_any_loaded_data():
+            if not self._confirm_replace_data(
+                "Import File",
+                "There is already imported or fetched data loaded in memory. "
+                "Importing a new file will replace the imported-file dataset for both pipelines.",
+            ):
+                return
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Data File",
             "",
-            "Supported Files (*.csv *.tsv *.xlsx);;CSV Files (*.csv);;TSV Files (*.tsv);;Excel Files (*.xlsx)",
+            "Supported Files (*.csv *.tsv *.xlsx *.xlsm);;CSV Files (*.csv);;TSV Files (*.tsv);;Excel Files (*.xlsx *.xlsm)",
         )
 
         if not file_path:
@@ -690,40 +1039,169 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if df.empty:
+        if df.empty or df.dropna(how="all").empty:
             QMessageBox.warning(
                 self,
                 "Empty File",
-                "The selected file does not contain any rows.",
+                "The selected file does not contain any usable rows.",
             )
             return
 
-        self.df = df
-        self.file_label.setText(file_path)
-        self._populate_column_boxes()
+        if len(df.columns) == 0:
+            QMessageBox.warning(
+                self,
+                "Invalid File",
+                "The selected file does not contain any columns.",
+            )
+            return
 
+        self.shared_df = df
+        self.imported_file_path = file_path
+        auto_detected_pipelines = []
         for pipeline_key in PIPELINES:
-            self.pipeline_state[pipeline_key]["missing"] = []
-            self.pipeline_state[pipeline_key]["enabled"] = False
-            self.pipeline_state[pipeline_key]["valid"] = False
-            self.pipeline_state[pipeline_key]["auto_selected"] = False
-            self.pipeline_widgets[pipeline_key]["column_box"].setCurrentText("")
+            self.pipeline_state[pipeline_key]["dataframes"]["import"] = df
             self.pipeline_widgets[pipeline_key]["expected_input"].clear()
             self.pipeline_widgets[pipeline_key]["expected_input"].setStyleSheet("")
-            self._reset_pipeline_stats(pipeline_key)
-            self._set_pipeline_enabled(pipeline_key, False)
-
-        for pipeline_key in PIPELINES:
-            auto_col = self.auto_detect_column(pipeline_key)
-            column_box = self.pipeline_widgets[pipeline_key]["column_box"]
-            if auto_col:
-                self.pipeline_state[pipeline_key]["auto_selected"] = True
-                self._set_pipeline_enabled(pipeline_key, True)
-                index = column_box.findText(auto_col)
-                column_box.setCurrentIndex(index)
-                self.validate_selected_column(pipeline_key, show_error=False)
+            if self._activate_dataframe(pipeline_key, "import", auto_enable=False):
+                auto_detected_pipelines.append(PIPELINES[pipeline_key]["title"])
 
         self._set_status(self._match_status_message())
+        self._refresh_actions()
+        if not auto_detected_pipelines:
+            QMessageBox.information(
+                self,
+                "Manual Review Needed",
+                "The file loaded successfully, but no Trace ID or Company ID column "
+                "was auto-detected. Please review the column selectors manually.",
+            )
+
+    def fetch_pipeline_from_db(self, pipeline_key):
+        if self.pipeline_state[pipeline_key]["busy"]:
+            return
+
+        if self._pipeline_has_available_data(pipeline_key):
+            source_name = PIPELINES[pipeline_key]["title"]
+            if not self._confirm_replace_data(
+                PIPELINES[pipeline_key]["fetch_button_text"],
+                f"{source_name} already has data loaded in memory. Fetching from DB will "
+                "replace the active dataset for that pipeline only.",
+            ):
+                return
+
+        worker = DataFetchWorker(pipeline_key)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.status.connect(self._handle_fetch_status)
+        worker.finished.connect(self._handle_fetch_complete)
+        worker.failed.connect(self._handle_fetch_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda key=pipeline_key: self._cleanup_fetch_thread(key))
+
+        self.fetch_threads[pipeline_key] = thread
+        self.fetch_workers[pipeline_key] = worker
+        self._set_pipeline_busy(pipeline_key, True)
+        self._set_status(f"Preparing {PIPELINES[pipeline_key]['title']} fetch from Zoho DB...")
+        thread.start()
+
+    def _handle_fetch_status(self, pipeline_key, message):
+        self._set_status(f"{PIPELINES[pipeline_key]['title']}: {message}")
+
+    def _handle_fetch_complete(self, pipeline_key, dataframe):
+        self._set_pipeline_busy(pipeline_key, False)
+
+        if dataframe is None or dataframe.empty:
+            QMessageBox.warning(
+                self,
+                "No Records Returned",
+                f"Zoho returned no rows for the {PIPELINES[pipeline_key]['title']} dataset.",
+            )
+            self._set_status(self._match_status_message())
+            return
+
+        self.pipeline_state[pipeline_key]["dataframes"]["db"] = dataframe
+        auto_detected = self._activate_dataframe(pipeline_key, "db", auto_enable=True)
+        if auto_detected:
+            self._set_status(
+                f"{PIPELINES[pipeline_key]['title']} loaded from DB."
+            )
+        else:
+            self._set_status(
+                f"{PIPELINES[pipeline_key]['title']} loaded from DB. Select the ID column."
+            )
+        self._refresh_actions()
+
+    def _handle_fetch_failed(self, pipeline_key, message):
+        self._set_pipeline_busy(pipeline_key, False)
+        QMessageBox.warning(
+            self,
+            "Zoho Fetch Failed",
+            message,
+        )
+        self._set_status(
+            f"{PIPELINES[pipeline_key]['title']} DB fetch failed."
+        )
+
+    def _cleanup_fetch_thread(self, pipeline_key):
+        self.fetch_threads.pop(pipeline_key, None)
+        self.fetch_workers.pop(pipeline_key, None)
+        self._refresh_actions()
+
+    def closeEvent(self, event):
+        busy_pipelines = [
+            PIPELINES[key]["title"]
+            for key in PIPELINES
+            if self.pipeline_state[key]["busy"]
+        ]
+        if busy_pipelines:
+            QMessageBox.warning(
+                self,
+                "Fetch In Progress",
+                "Please wait for the current Zoho fetch to finish before closing the app.\n\n"
+                + ", ".join(busy_pipelines)
+                + " is still downloading.",
+            )
+            event.ignore()
+            return
+
+        super().closeEvent(event)
+
+    def clear_all_data(self):
+        if not self._has_any_loaded_data():
+            return
+
+        if not self._confirm_clear_all():
+            return
+
+        self.shared_df = None
+        self.imported_file_path = None
+        for pipeline_key in PIPELINES:
+            state = self.pipeline_state[pipeline_key]
+            state["missing"] = []
+            state["enabled"] = False
+            state["valid"] = False
+            state["auto_selected"] = False
+            state["dataframes"]["import"] = None
+            state["dataframes"]["db"] = None
+            state["active_source"] = None
+
+            widgets = self.pipeline_widgets[pipeline_key]
+            widgets["column_box"].blockSignals(True)
+            widgets["column_box"].clear()
+            widgets["column_box"].setCurrentText("")
+            widgets["column_box"].blockSignals(False)
+            widgets["expected_input"].clear()
+            widgets["expected_input"].setStyleSheet("")
+
+            self._reset_pipeline_stats(pipeline_key)
+            self._set_pipeline_enabled(pipeline_key, False)
+            self._update_source_label(pipeline_key)
+
+        self._set_status("All files were cleared from memory.")
         self._refresh_actions()
 
     def _validate_active_pipelines(self):
@@ -745,6 +1223,15 @@ class MainWindow(QMainWindow):
             if not self.pipeline_state[pipeline_key]["enabled"]:
                 continue
 
+            dataframe = self._get_current_dataframe(pipeline_key)
+            if dataframe is None:
+                QMessageBox.warning(
+                    self,
+                    "No Data Source",
+                    f"Load imported data or fetch Zoho data for {config['title']} first.",
+                )
+                return None
+
             column = self.pipeline_widgets[pipeline_key]["column_box"].currentText().strip()
             if not column:
                 QMessageBox.warning(
@@ -754,11 +1241,11 @@ class MainWindow(QMainWindow):
                 )
                 return None
 
-            if column not in self.df.columns:
+            if column not in dataframe.columns:
                 QMessageBox.warning(
                     self,
                     "Invalid Column",
-                    f"Selected column for {config['title']} was not found in the CSV.",
+                    f"Selected column for {config['title']} was not found in the active data source.",
                 )
                 return None
 
@@ -789,15 +1276,19 @@ class MainWindow(QMainWindow):
         return None
 
     def export_missing(self):
-        if self.df is None:
-            QMessageBox.warning(self, "No File", "Import a CSV file first.")
+        if not any(self._get_current_dataframe(key) is not None for key in PIPELINES):
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "Import a file or fetch a Zoho dataset first.",
+            )
             return
 
         valid_pipelines = self._validate_active_pipelines()
         if not valid_pipelines:
             return
 
-        save_path, _ = QFileDialog.getSaveFileName(
+        save_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Save Missing IDs",
             "missing_trace_and_company_ids.csv",
@@ -806,6 +1297,8 @@ class MainWindow(QMainWindow):
 
         if not save_path:
             return
+
+        save_path = self._resolve_export_path(save_path, selected_filter)
 
         output_df = self._build_output_frame(valid_pipelines)
 
